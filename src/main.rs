@@ -1,5 +1,6 @@
 mod ansi_music;
 mod apc_audio;
+#[cfg(feature = "localaudio")]
 mod audio;
 mod config;
 mod cp437;
@@ -16,12 +17,15 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use gameboy_core::{Gameboy, RTC, StepResult};
+#[cfg(feature = "localaudio")]
 use rodio::{OutputStream, Sink};
 use std::io::{self, Write};
 use std::path::Path;
+#[cfg(feature = "localaudio")]
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "localaudio")]
 use audio::{AudioBuffer, GameboyAudioSource};
 use framebuffer::{FrameBuffer, GB_HEIGHT, GB_WIDTH};
 use input::map_key_to_button;
@@ -305,13 +309,20 @@ fn run_game(
         std::thread::sleep(Duration::from_millis(500)); // Brief pause to show message
     }
 
-    // Setup audio output (lock-free buffer)
-    // Larger buffer (16K samples = ~180ms stereo) for more headroom
+    // Local PCM playback via rodio is an optional build feature (`localaudio`).
+    // The distributed door binary is built WITHOUT it: a door never plays to a
+    // local sound card (it streams ANSI/APC audio to the caller), and dropping
+    // rodio makes the binary pure-Rust and dependency-free (no libasound2),
+    // which is what lets CI cross-compile it for every sysop target. Force the
+    // device path off when the feature is absent.
+    let audio_enabled = audio_enabled && cfg!(feature = "localaudio");
+
+    // Setup audio output (lock-free buffer). Only open a device when enabled;
+    // unconditionally calling OutputStream::try_default() aborts on a headless
+    // host. (Local patch -- see PATCH-NOTES.md)
+    #[cfg(feature = "localaudio")]
     let audio_buffer = Arc::new(AudioBuffer::new(16384));
-    // Only open an audio device when audio is actually enabled. On headless
-    // servers (e.g. a BBS door host) there is no PCM device, and unconditionally
-    // calling OutputStream::try_default() aborts the process. With --mute we skip
-    // device init entirely. (Local patch -- see PATCH-NOTES.md)
+    #[cfg(feature = "localaudio")]
     let (_stream, sink) = if audio_enabled {
         let (stream, stream_handle) =
             OutputStream::try_default().expect("Failed to open audio output");
@@ -320,8 +331,8 @@ fn run_game(
     } else {
         (None, None)
     };
-
     // Pre-buffer some frames before starting audio to avoid initial underruns
+    #[cfg(feature = "localaudio")]
     let mut pre_buffer_frames = if audio_enabled { 3 } else { 0 };
 
     let mut stdout = io::stdout();
@@ -350,6 +361,14 @@ fn run_game(
     let mut last_render = Instant::now() - render_interval; // render immediately on entry
     let mut pace = LinkPace::new(render_interval);
 
+    // Simulation clock: emulate every GB frame whose wall-clock time has come,
+    // rather than one-frame-per-loop + sleep. thread::sleep reliably oversleeps
+    // (~16.67ms requested -> ~20ms actual), which otherwise runs the emulator —
+    // and thus audio production — below realtime, starving the APC stream. Up to
+    // MAX_CATCHUP frames are repaid per loop; beyond that we resync (bounded).
+    const MAX_CATCHUP: u32 = 12;
+    let mut sim_deadline = Instant::now();
+
     // Periodic keyframe: force a full (clear-less) repaint every few seconds so a
     // cell corrupted by line noise on a lossy link self-heals — delta encoding
     // otherwise only repaints cells the game itself changes.
@@ -372,8 +391,10 @@ fn run_game(
     // APC PCM streaming: capture the emulator's audio and ship it to a
     // SyncTERM-APC-capable terminal as chunked clips (~120 ms).
     let mut apc = if apc_enabled {
-        // 120 ms chunks, 400 ms pre-roll cushion (FIFO lead for the client mixer).
-        Some(apc_audio::ApcAudio::new(120, 400))
+        // 120 ms chunks, 240 ms pre-roll. The wall-clock loop keeps the stream
+        // fed at realtime, so the cushion only needs to cover brief jitter — a
+        // smaller lead means less audio-vs-video latency. Raise if gaps return.
+        Some(apc_audio::ApcAudio::new(120, 240))
     } else {
         None
     };
@@ -389,7 +410,6 @@ fn run_game(
     let button_timeout = Duration::from_millis(150);
 
     while running {
-        let frame_start = Instant::now();
 
         // Only use timeout-based release for terminals that don't support release events
         if !terminal_supports_release {
@@ -480,26 +500,38 @@ fn run_game(
             }
         }
 
-        // Run emulation until VBlank
-        loop {
-            let result = gameboy.emulate(&mut framebuffer);
-            match result {
-                StepResult::VBlank => break,
-                StepResult::AudioBufferFull => {
-                    // Pull PCM if anything consumes it: the local device (rodio)
-                    // and/or the APC streamer.
-                    if audio_enabled || apc.is_some() {
-                        let samples = gameboy.get_audio_buffer();
-                        if audio_enabled {
-                            audio_buffer.push_samples(samples);
-                        }
-                        if let Some(a) = apc.as_mut() {
-                            a.push_samples(samples);
+        // Advance the simulation to wall-clock: run every GB frame whose time
+        // has come. Repays sleep overshoot / brief loop stalls by emulating
+        // extra frames here, so game speed and audio production stay at realtime.
+        let mut frames_run = 0u32;
+        while Instant::now() >= sim_deadline && frames_run < MAX_CATCHUP {
+            loop {
+                match gameboy.emulate(&mut framebuffer) {
+                    StepResult::VBlank => break,
+                    StepResult::AudioBufferFull => {
+                        // Pull PCM if anything consumes it: the local device
+                        // (rodio) and/or the APC streamer.
+                        if audio_enabled || apc.is_some() {
+                            let samples = gameboy.get_audio_buffer();
+                            #[cfg(feature = "localaudio")]
+                            if audio_enabled {
+                                audio_buffer.push_samples(samples);
+                            }
+                            if let Some(a) = apc.as_mut() {
+                                a.push_samples(samples);
+                            }
                         }
                     }
+                    StepResult::Nothing => {}
                 }
-                StepResult::Nothing => {}
             }
+            sim_deadline += frame_duration;
+            frames_run += 1;
+        }
+        if frames_run >= MAX_CATCHUP {
+            // Can't keep up (or a long stall) — resync so we don't spiral. This
+            // is the only place sim time is dropped (a bounded audio gap).
+            sim_deadline = Instant::now();
         }
 
         // Ship any full APC audio chunks now, regardless of video pacing, so
@@ -508,8 +540,10 @@ fn run_game(
             a.emit_ready(&mut stdout)?;
         }
 
-        // Start audio playback after pre-buffering (independent of transmit
-        // pacing — audio should start even while video frames are being skipped).
+        // Start local audio playback after pre-buffering (localaudio builds only;
+        // independent of transmit pacing — audio should start even while video
+        // frames are being skipped).
+        #[cfg(feature = "localaudio")]
         if pre_buffer_frames > 0 {
             pre_buffer_frames -= 1;
             if pre_buffer_frames == 0 {
@@ -523,7 +557,7 @@ fn run_game(
         // Transmit a frame at the capped rate, dropping it when the link is
         // behind. The emulator already advanced above, so the game keeps full
         // speed and input stays responsive even while frames are skipped.
-        if last_render.elapsed() >= render_interval {
+        if frames_run > 0 && last_render.elapsed() >= render_interval {
             last_render = Instant::now();
             if !pace.skip_frame() {
                 let write_start = Instant::now();
@@ -557,11 +591,12 @@ fn run_game(
             }
         }
 
-        // Frame timing — pace the emulator to ~60 Hz (game speed), regardless of
-        // how many frames were actually transmitted this second.
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_duration {
-            std::thread::sleep(frame_duration - elapsed);
+        // Sleep until the next frame is due (no busy-spin). Oversleep here is
+        // harmless — the catch-up loop above repays it on the next iteration, so
+        // the long-run emulation rate stays locked to wall-clock.
+        let now = Instant::now();
+        if sim_deadline > now {
+            std::thread::sleep((sim_deadline - now).min(frame_duration));
         }
     }
 

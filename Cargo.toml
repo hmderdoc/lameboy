@@ -18,7 +18,16 @@ crossterm = "0.27"
 # Vendored + patched to expose APU pulse-channel state for the ANSI-music engine.
 # See vendor/gameboy_core/PATCH-NOTES.md.
 gameboy_core = { path = "vendor/gameboy_core" }
-rodio = "0.19"
+# Local sound-card playback. Optional and OFF by default: a BBS door never plays
+# to a local device (it streams ANSI/APC audio to the caller), and omitting rodio
+# keeps the binary pure-Rust with no native audio dependency (no libasound2) —
+# which is what lets release CI cross-compile for every target. Build with
+# `--features localaudio` for real audio when running locally.
+rodio = { version = "0.19", optional = true }
+
+[features]
+default = []
+localaudio = ["dep:rodio"]
 
 [profile.release]
 opt-level = 3

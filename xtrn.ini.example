@@ -1,0 +1,29 @@
+; ---------------------------------------------------------------------------
+; Game Boy door — Synchronet external program definition.
+;
+; Easiest: add it in SCFG → External Programs → Online Programs (Doors), using
+; the command line below. Editing ctrl/xtrn.ini by hand also works — paste this
+; stanza under your desired section (e.g. [sec:GAMES]) and recycle the BBS.
+;
+; Install layout (under your Synchronet xtrn/ directory):
+;   xtrn/gb/terminal_gameboy        <- the binary for your platform (from a release)
+;   xtrn/gb/roms/                   <- your own legally-obtained .gb / .gbc files
+;
+; Command-line specifiers:
+;   %4  expands to the zero-padded BBS user number — keys per-user saves and
+;       preferences (saves land in roms/.saves/<user>/). Omit it for shared saves.
+; Flags:
+;   --mute        never open a local sound device (required on a headless host)
+;   --ansi-music  allow ANSI-music sound (caller picks Off/ANSI/APC in the menu)
+;   --fps <n>     transmit frame-rate cap, 5-60 (default 20)
+; ---------------------------------------------------------------------------
+
+[prog:GAMES:GB]
+    name=Game Boy
+    ars=
+    type=0
+    settings=0x1004005
+    cmd=./terminal_gameboy --mute --ansi-music --user %4
+    startup_dir=../xtrn/gb
+    max_time=0
+    max_inactivity=0
