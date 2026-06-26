@@ -1,0 +1,13 @@
+# Build artifacts
+/target/
+
+# ROMs and per-user saves: large and/or copyrighted — never commit.
+# (.saves lives under roms/, so this covers it too.)
+/roms/
+
+# Deployed binary (build artifact produced by `cargo build --release`)
+/terminal_gameboy
+
+# ANSI capture dumps (local debugging scratch, not part of the source)
+/menu.bin
+/music_cap.bin

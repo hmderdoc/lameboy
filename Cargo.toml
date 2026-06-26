@@ -1,0 +1,27 @@
+[package]
+name = "terminal_gameboy"
+version = "0.1.2"
+edition = "2021"
+authors = ["Dillon Quigley <dillonmquigley@gmail.com>"]
+description = "A terminal-based Game Boy emulator with ASCII and block rendering modes"
+license = "MIT"
+repository = "https://github.com/dquigles/terminal_gameboy"
+readme = "README.md"
+keywords = ["gameboy", "emulator", "terminal", "ascii", "retro"]
+categories = ["command-line-utilities", "emulators", "games"]
+
+# Exclude ROMs and saves from the published crate
+exclude = ["roms/", ".saves/"]
+
+[dependencies]
+crossterm = "0.27"
+# Vendored + patched to expose APU pulse-channel state for the ANSI-music engine.
+# See vendor/gameboy_core/PATCH-NOTES.md.
+gameboy_core = { path = "vendor/gameboy_core" }
+rodio = "0.19"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1  # Better inlining across crates
+panic = "abort"    # Smaller binary, less overhead
