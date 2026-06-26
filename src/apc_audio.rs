@@ -24,6 +24,8 @@ const SLOTS: u8 = 8;
 
 pub struct ApcAudio {
     chunk_samples: usize,   // mono samples per emitted chunk (OUT_RATE based)
+    preroll_samples: usize, // buffer this much before the first (burst) emission
+    primed: bool,           // false until the pre-roll cushion has been sent
     accum: Vec<i16>,        // mono S16 @ OUT_RATE awaiting emission
     carry: f32,             // leftover mono sample for 2:1 decimation
     have_carry: bool,
@@ -32,11 +34,18 @@ pub struct ApcAudio {
 
 impl ApcAudio {
     /// `chunk_ms` trades latency (≈chunk length) against per-chunk overhead.
-    pub fn new(chunk_ms: u32) -> Self {
-        let chunk_samples = (OUT_RATE as u64 * chunk_ms as u64 / 1000) as usize;
+    /// `preroll_ms` is the FIFO lead built before playback starts: the client
+    /// mixer (shim or SyncTERM) plays queued clips immediately, so the only way
+    /// to give it a jitter cushion is to queue this much ahead in one burst,
+    /// then stream realtime. Larger = fewer gaps, more audio latency.
+    pub fn new(chunk_ms: u32, preroll_ms: u32) -> Self {
+        let chunk_samples = ((OUT_RATE as u64 * chunk_ms as u64 / 1000) as usize).max(1);
+        let preroll_samples = (OUT_RATE as u64 * preroll_ms as u64 / 1000) as usize;
         Self {
-            chunk_samples: chunk_samples.max(1),
-            accum: Vec::with_capacity(chunk_samples + 64),
+            chunk_samples,
+            preroll_samples,
+            primed: false,
+            accum: Vec::with_capacity(preroll_samples + chunk_samples + 64),
             carry: 0.0,
             have_carry: false,
             slot: 0,
@@ -65,6 +74,14 @@ impl ApcAudio {
     /// Emit every full chunk currently buffered. Call once per frame; flushes
     /// `out` so audio keeps flowing even when video frames are being skipped.
     pub fn emit_ready(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if !self.primed {
+            // Hold output until the pre-roll cushion is built, then burst it all
+            // out at once so the client FIFO starts with a lead.
+            if self.accum.len() < self.preroll_samples {
+                return Ok(());
+            }
+            self.primed = true;
+        }
         let mut emitted = false;
         while self.accum.len() >= self.chunk_samples {
             self.emit_chunk(self.chunk_samples, out)?;
@@ -206,7 +223,7 @@ mod tests {
 
     #[test]
     fn chunks_emit_when_full_and_rotate_slots() {
-        let mut a = ApcAudio::new(10); // 220 mono samples per chunk @22050
+        let mut a = ApcAudio::new(10, 0); // 220-sample chunks, no pre-roll for the test
         // Feed ~30ms of stereo @44100 -> should yield a couple of chunks.
         let stereo = vec![0.25f32; 44100 * 2 * 30 / 1000 * 2];
         a.push_samples(&stereo);

@@ -372,7 +372,8 @@ fn run_game(
     // APC PCM streaming: capture the emulator's audio and ship it to a
     // SyncTERM-APC-capable terminal as chunked clips (~120 ms).
     let mut apc = if apc_enabled {
-        Some(apc_audio::ApcAudio::new(120))
+        // 120 ms chunks, 400 ms pre-roll cushion (FIFO lead for the client mixer).
+        Some(apc_audio::ApcAudio::new(120, 400))
     } else {
         None
     };
