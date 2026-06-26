@@ -34,7 +34,8 @@ pub struct Config {
     pub roms_dir: Option<PathBuf>,
     /// Persisted render mode: Some(true) = Block, Some(false) = ASCII.
     pub render_block: Option<bool>,
-    pub audio_enabled: Option<bool>,
+    /// Persisted sound mode: "off" | "ansi" | "apc".
+    pub sound: Option<String>,
     /// Persisted game-list filter: "all" | "gb" | "gbc".
     pub filter: Option<String>,
 }
@@ -59,8 +60,15 @@ pub fn load(user: Option<&str>) -> Config {
             }
         } else if let Some(val) = line.strip_prefix("render=") {
             cfg.render_block = Some(val.trim().eq_ignore_ascii_case("block"));
+        } else if let Some(val) = line.strip_prefix("sound=") {
+            cfg.sound = Some(val.trim().to_lowercase());
         } else if let Some(val) = line.strip_prefix("audio=") {
-            cfg.audio_enabled = Some(val.trim().eq_ignore_ascii_case("on"));
+            // Back-compat: the old on/off audio toggle maps to ansi/off.
+            if cfg.sound.is_none() {
+                cfg.sound = Some(
+                    if val.trim().eq_ignore_ascii_case("on") { "ansi" } else { "off" }.to_string(),
+                );
+            }
         } else if let Some(val) = line.strip_prefix("filter=") {
             cfg.filter = Some(val.trim().to_lowercase());
         }
@@ -87,8 +95,8 @@ pub fn save(user: Option<&str>, cfg: &Config) -> io::Result<()> {
     if let Some(block) = cfg.render_block {
         contents.push_str(&format!("render={}\n", if block { "block" } else { "ascii" }));
     }
-    if let Some(audio) = cfg.audio_enabled {
-        contents.push_str(&format!("audio={}\n", if audio { "on" } else { "off" }));
+    if let Some(ref s) = cfg.sound {
+        contents.push_str(&format!("sound={}\n", s));
     }
     if let Some(ref f) = cfg.filter {
         contents.push_str(&format!("filter={}\n", f));

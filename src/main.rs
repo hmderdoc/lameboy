@@ -1,4 +1,5 @@
 mod ansi_music;
+mod apc_audio;
 mod audio;
 mod config;
 mod cp437;
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use audio::{AudioBuffer, GameboyAudioSource};
 use framebuffer::{FrameBuffer, GB_HEIGHT, GB_WIDTH};
 use input::map_key_to_button;
-use menu::show_menu;
+use menu::{show_menu, SoundMode};
 use renderer::{RenderConfig, RenderMode, Renderer};
 use save::{get_save_path, load_save, save_game};
 
@@ -246,6 +247,7 @@ fn main() -> io::Result<()> {
             mode,
             !force_mute,
             ansi_music_flag,
+            false, // APC streaming is only meaningful from the menu/door path
             user_id.as_deref(),
             render_fps,
         );
@@ -260,11 +262,19 @@ fn main() -> io::Result<()> {
         match show_menu(user_id.as_deref(), animate)? {
             Some(config) => {
                 let mode = cli_mode.unwrap_or(config.render_mode);
-                let audio_enabled = config.audio_enabled && !force_mute;
+                let want_apc = config.sound == SoundMode::Apc;
+                // Local PCM device (rodio) only for a non-APC, non-Off mode when
+                // not muted. The door runs --mute, so it never opens a device;
+                // APC instead streams PCM to the terminal.
+                let audio_enabled =
+                    !force_mute && config.sound != SoundMode::Off && !want_apc;
                 // ANSI music plays when the door enabled it (--ansi-music) and the
-                // player left the menu's Audio toggle on.
-                let music_enabled = ansi_music_flag && config.audio_enabled;
-                run_game(&config.rom_path, mode, audio_enabled, music_enabled, user_id.as_deref(), render_fps)?;
+                // player selected ANSI mode.
+                let music_enabled = ansi_music_flag && config.sound == SoundMode::Ansi;
+                run_game(
+                    &config.rom_path, mode, audio_enabled, music_enabled,
+                    want_apc, user_id.as_deref(), render_fps,
+                )?;
                 // Only play the startup sweep on first entry, not after each game.
                 animate = false;
             }
@@ -280,6 +290,7 @@ fn run_game(
     mode: RenderMode,
     audio_enabled: bool,
     music_enabled: bool,
+    apc_enabled: bool,
     user_id: Option<&str>,
     render_fps: f64,
 ) -> io::Result<()> {
@@ -357,6 +368,14 @@ fn run_game(
 
     // ANSI-music engine: approximates the lead pulse channel via terminal beeps.
     let mut ansi = ansi_music::AnsiMusic::new(music_enabled);
+
+    // APC PCM streaming: capture the emulator's audio and ship it to a
+    // SyncTERM-APC-capable terminal as chunked clips (~120 ms).
+    let mut apc = if apc_enabled {
+        Some(apc_audio::ApcAudio::new(120))
+    } else {
+        None
+    };
 
     let mut running = true;
     // Track when each button was last seen (press or repeat event)
@@ -466,14 +485,26 @@ fn run_game(
             match result {
                 StepResult::VBlank => break,
                 StepResult::AudioBufferFull => {
-                    // Push audio samples to the buffer (lock-free)
-                    if audio_enabled {
+                    // Pull PCM if anything consumes it: the local device (rodio)
+                    // and/or the APC streamer.
+                    if audio_enabled || apc.is_some() {
                         let samples = gameboy.get_audio_buffer();
-                        audio_buffer.push_samples(samples);
+                        if audio_enabled {
+                            audio_buffer.push_samples(samples);
+                        }
+                        if let Some(a) = apc.as_mut() {
+                            a.push_samples(samples);
+                        }
                     }
                 }
                 StepResult::Nothing => {}
             }
+        }
+
+        // Ship any full APC audio chunks now, regardless of video pacing, so
+        // sound keeps flowing even while frames are being skipped.
+        if let Some(a) = apc.as_mut() {
+            a.emit_ready(&mut stdout)?;
         }
 
         // Start audio playback after pre-buffering (independent of transmit
@@ -531,6 +562,11 @@ fn run_game(
         if elapsed < frame_duration {
             std::thread::sleep(frame_duration - elapsed);
         }
+    }
+
+    // Emit any trailing partial audio chunk before tearing down.
+    if let Some(a) = apc.as_mut() {
+        let _ = a.flush(&mut stdout);
     }
 
     // Cleanup terminal

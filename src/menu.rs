@@ -18,7 +18,7 @@ use crate::renderer::RenderMode;
 pub struct MenuConfig {
     pub rom_path: PathBuf,
     pub render_mode: RenderMode,
-    pub audio_enabled: bool,
+    pub sound: SoundMode,
 }
 
 /// How many ROM rows are shown in the game list at once.
@@ -91,11 +91,61 @@ impl RomFilter {
     }
 }
 
+/// How game sound is delivered to the caller.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SoundMode {
+    Off,
+    Ansi, // ANSI-music (MML beeps) — monophonic, universal
+    Apc,  // SyncTERM APC PCM stream — full Game Boy audio
+}
+
+impl SoundMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Ansi,
+            Self::Ansi => Self::Apc,
+            Self::Apc => Self::Off,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Off => Self::Apc,
+            Self::Ansi => Self::Off,
+            Self::Apc => Self::Ansi,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off ",
+            Self::Ansi => "ANSI",
+            Self::Apc => "APC ",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ansi => "ansi",
+            Self::Apc => "apc",
+        }
+    }
+
+    fn from_code(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "apc" => Self::Apc,
+            _ => Self::Ansi,
+        }
+    }
+}
+
 /// Menu state
 struct MenuState {
     // Settings
     render_mode: RenderMode,
-    audio_enabled: bool,
+    sound: SoundMode,
     filter: RomFilter,
     roms_dir: PathBuf,
 
@@ -272,7 +322,7 @@ impl MenuState {
             } else {
                 RenderMode::Ascii
             },
-            audio_enabled: saved.audio_enabled.unwrap_or(true),
+            sound: saved.sound.as_deref().map(SoundMode::from_code).unwrap_or(SoundMode::Ansi),
             filter: saved.filter.as_deref().map(RomFilter::from_code).unwrap_or(RomFilter::All),
             roms_dir,
             user: user.map(|u| u.to_string()),
@@ -355,7 +405,7 @@ impl MenuState {
             &config::Config {
                 roms_dir: saved_dir,
                 render_block: Some(self.render_mode == RenderMode::Block),
-                audio_enabled: Some(self.audio_enabled),
+                sound: Some(self.sound.code().to_string()),
                 filter: Some(self.filter.code().to_string()),
             },
         );
@@ -529,7 +579,11 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                         state.persist_prefs();
                     }
                     MenuSection::Audio => {
-                        state.audio_enabled = !state.audio_enabled;
+                        state.sound = if key.code == KeyCode::Left {
+                            state.sound.prev()
+                        } else {
+                            state.sound.next()
+                        };
                         state.persist_prefs();
                     }
                     MenuSection::Filter => {
@@ -552,7 +606,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                             return Ok(Some(MenuConfig {
                                 rom_path,
                                 render_mode: state.render_mode,
-                                audio_enabled: state.audio_enabled,
+                                sound: state.sound,
                             }));
                         }
                     }
@@ -566,7 +620,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                                 &config::Config {
                                     roms_dir: Some(chosen),
                                     render_block: Some(state.render_mode == RenderMode::Block),
-                                    audio_enabled: Some(state.audio_enabled),
+                                    sound: Some(state.sound.code().to_string()),
                                     filter: Some(state.filter.code().to_string()),
                                 },
                             );
@@ -580,7 +634,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                         state.persist_prefs();
                     }
                     MenuSection::Audio => {
-                        state.audio_enabled = !state.audio_enabled;
+                        state.sound = state.sound.next();
                         state.persist_prefs();
                     }
                     MenuSection::Filter => {
@@ -635,13 +689,13 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         state.current_section == MenuSection::RenderMode
     )?;
     
-    // Audio
+    // Sound (Off / ANSI music / APC PCM)
     draw_option(
-        stdout, 
-        4, 
-        menu_start_y + 3, 
-        "Audio      ", 
-        &format!("◄ {}  ►", if state.audio_enabled { "On " } else { "Off" }),
+        stdout,
+        4,
+        menu_start_y + 3,
+        "Sound      ",
+        &format!("◄ {} ►", state.sound.label()),
         state.current_section == MenuSection::Audio
     )?;
     
