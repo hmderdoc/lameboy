@@ -216,7 +216,8 @@ fn main() -> io::Result<()> {
     // emulator still runs at full speed regardless.
     let render_fps = parse_fps(&args).unwrap_or(DEFAULT_RENDER_FPS);
     // First non-flag argument (if any) is the ROM path. (Skip the value that
-    // follows a `--user` flag so it isn't mistaken for a ROM path.)
+    // follows a value-taking flag (`--user`, `--fps`) so it isn't mistaken for a
+    // ROM path.)
     let positional_rom = {
         let mut found = None;
         let mut skip_next = false;
@@ -225,7 +226,7 @@ fn main() -> io::Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--user" {
+            if a == "--user" || a == "--fps" {
                 skip_next = true;
                 continue;
             }
@@ -337,6 +338,12 @@ fn run_game(
     let render_interval = Duration::from_secs_f64(1.0 / render_fps.clamp(1.0, 60.0));
     let mut last_render = Instant::now() - render_interval; // render immediately on entry
     let mut pace = LinkPace::new(render_interval);
+
+    // Periodic keyframe: force a full (clear-less) repaint every few seconds so a
+    // cell corrupted by line noise on a lossy link self-heals — delta encoding
+    // otherwise only repaints cells the game itself changes.
+    let keyframe_interval = Duration::from_secs(7);
+    let mut keyframe_timer = Instant::now();
 
     // FPS tracking (counts frames actually transmitted)
     let mut frame_count = 0u32;
@@ -488,6 +495,12 @@ fn run_game(
             last_render = Instant::now();
             if !pace.skip_frame() {
                 let write_start = Instant::now();
+
+                // Periodic keyframe so corrupted cells self-heal (see above).
+                if keyframe_timer.elapsed() >= keyframe_interval {
+                    renderer.request_repaint();
+                    keyframe_timer = Instant::now();
+                }
 
                 // ANSI music first (small), then the frame. Both go through the
                 // same blocking writes, so a stalled link is measured below.
