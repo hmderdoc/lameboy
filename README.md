@@ -79,30 +79,38 @@ BBSes — the flag reference is further down.
 
 ### Synchronet
 
-Add it in SCFG → *External Programs* → *Online Programs*. On **Windows** the
-connection is a DOOR32.SYS socket; on **Unix** Synchronet usually connects the
-door over stdin/stdout (no dropfile — just pass `--user %4`).
+Add it in SCFG → *External Programs* → *Online Programs*. The simplest setup
+uses the **Standard** I/O method (stdio) and `--user %4` — no drop file needed:
 
 ```
-                         gameboy
-  ┌─────────────────────────────────────────────────────────┐
-  │ Name ...................... Game Boy                      │
-  │ Internal Code ............. GAMEBOY                       │
-  │ Start-up Directory ........ c:\sbbs\xtrn\gb               │
-  │ Command Line .............. gb.exe --dropfile DOOR32.SYS  │
-  │ Native Executable ......... Yes                          │
-  │ Multiple Concurrent Users . Yes                          │
-  │ I/O Method ................ Socket                       │
-  │ BBS Drop File Type ........ DOOR32.SYS                   │
-  │ Place Drop File In ........ Start-up Directory           │
-  └─────────────────────────────────────────────────────────┘
-
-  Unix / stdio instead of a dropfile:   ./terminal_gameboy --user %!
+[gameboy]
+ 1: Name ........................ Game Boy
+ 2: Internal Code ............... GAMEBOY
+ 3: Start-up Directory .......... c:\sbbs\xtrn\gb
+ 4: Command Line ................ gb.exe --user %4
+ 5: Clean-up Command Line .......
+ 6: Execution Cost .............. None
+ 7: Access Requirements .........
+ 8: Execution Requirements ......
+ 9: Multiple Concurrent Users ... Yes
+10: Native Executable ........... Yes
+11: I/O Method .................. Standard
+12: Use Shell or New Context .... No
+13: Modify User Data ............ No
+14: Execute on Event ............ No
+15: Pause After Execution ....... No
+16: Disable Local Display ....... No
+17: BBS Drop File Type .......... DOOR32.SYS
+18: Place Drop File In .......... Start-up Directory
+19: Time Options...
 ```
 
-Because the drop file is placed in the start-up directory (which is the door's
-working directory), `--dropfile DOOR32.SYS` finds it. `--user` is optional here —
-the user identity is read from the drop file.
+`%4` is the zero-padded user number; it keys per-user saves and preferences.
+
+**Prefer a socket?** Set line 11 `I/O Method` to **Socket** and line 4 to
+`gb.exe --dropfile DOOR32.SYS`. The drop file lands in the start-up directory
+(the door's working directory), so that relative path finds it; `--user` is then
+optional since the identity is read from the drop file.
 
 ### EleBBS / Mystic / other DOOR32.SYS BBSes
 
