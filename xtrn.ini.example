@@ -1,23 +1,23 @@
 ; ---------------------------------------------------------------------------
-; Game Boy door — Synchronet external program definition.
+; Game Boy door — external program / door definitions.
 ;
-; Easiest: add it in SCFG → External Programs → Online Programs (Doors), using
-; the command line below. Editing ctrl/xtrn.ini by hand also works — paste this
-; stanza under your desired section (e.g. [sec:GAMES]) and recycle the BBS.
+; The door reaches the caller one of two ways; pick the line that matches how
+; your BBS launches doors.
 ;
-; Install layout (under your Synchronet xtrn/ directory):
-;   xtrn/gb/terminal_gameboy        <- the binary for your platform (from a release)
-;   xtrn/gb/roms/                   <- your own legally-obtained .gb / .gbc files
+; Install layout (beside the binary):
+;   gb/terminal_gameboy            <- the binary for your platform (from a release)
+;   gb/roms/                       <- your own legally-obtained .gb / .gbc files
 ;
-; Command-line specifiers:
-;   %4  expands to the zero-padded BBS user number — keys per-user saves and
-;       preferences (saves land in roms/.saves/<user>/). Omit it for shared saves.
 ; Flags:
-;   --mute        never open a local sound device (required on a headless host)
-;   --ansi-music  allow ANSI-music sound (caller picks Off/ANSI/APC in the menu)
-;   --fps <n>     transmit frame-rate cap, 5-60 (default 20)
+;   --mute             never open a local sound device (required, headless host)
+;   --ansi-music       allow ANSI-music sound (caller picks Off/ANSI/APC in menu)
+;   --user <id>        per-user key for saves/prefs (stdio BBSes; see below)
+;   --dropfile <path>  DOOR32.SYS dropfile: inherited socket + user identity
+;   --fps <n>          transmit frame-rate cap, 5-60 (default 20)
 ; ---------------------------------------------------------------------------
 
+; --- Synchronet (stdio; %4 = zero-padded user number) ----------------------
+; Add via SCFG -> External Programs, or paste under a section (e.g. [sec:GAMES]).
 [prog:GAMES:GB]
     name=Game Boy
     ars=
@@ -27,3 +27,14 @@
     startup_dir=../xtrn/gb
     max_time=0
     max_inactivity=0
+
+; --- EleBBS / Mystic / Windows BBSes (DOOR32.SYS dropfile) ------------------
+; Configure as a door that writes a DOOR32.SYS dropfile and pass its path. The
+; user number/handle come from the dropfile, so --user is not needed. Example
+; command line (adapt the dropfile path/macro to your BBS):
+;
+;   terminal_gameboy.exe --mute --ansi-music --dropfile C:\bbs\node1\DOOR32.SYS
+;
+; The dropfile's comm handle (an inherited Winsock SOCKET on Windows, a socket
+; fd on unix) is used for all terminal I/O; if it isn't a telnet (type 2)
+; connection, the door falls back to stdio.

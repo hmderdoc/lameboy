@@ -1,16 +1,18 @@
-# Game Boy — Synchronet BBS Door
+# Game Boy — BBS Door
 
-A terminal Game Boy / Game Boy Color emulator packaged as a **Synchronet BBS
-door**: callers connect over telnet/SSH and play retro games in the BBS, with
-CP437 block/ASCII rendering, ANSI-music sound, per-user saves, and a ROM browser
-built for slow, remote terminals.
+A terminal Game Boy / Game Boy Color emulator packaged as a **BBS door**:
+callers connect over telnet/SSH and play retro games in the BBS, with CP437
+block/ASCII rendering, ANSI-music or streamed-PCM sound, per-user saves, and a
+ROM browser built for slow, remote terminals. It runs on any BBS that launches
+a door over stdio or hands it a connection via a **DOOR32.SYS** dropfile —
+Synchronet, EleBBS, Mystic, and friends, on Linux, Windows, macOS, or FreeBSD.
 
 > **Provenance.** This started from
 > [`terminal_gameboy`](https://github.com/dquigles/terminal_gameboy) by Dillon
 > Quigley (MIT), which renders the [`gameboy_core`](https://crates.io/crates/gameboy_core)
 > emulator to a local terminal. It has since **diverged substantially** to run as
-> a headless BBS door — see [BBS modifications](#bbs-modifications) and
-> [PATCH-NOTES.md](PATCH-NOTES.md). This is a standalone hobby project, not a
+> a headless, multi-user BBS door — see [BBS modifications](#bbs-modifications)
+> and [PATCH-NOTES.md](PATCH-NOTES.md). This is a standalone hobby project, not a
 > fork tracking upstream; we keep an eye on the original for the occasional
 > bugfix but do not intend to stay in sync or merge changes back.
 
@@ -27,23 +29,28 @@ over a remote link. Full detail (with file/symbol pointers) is in
   that supports them). Local sound-card playback (rodio) is an optional
   `localaudio` build feature, **off by default**, so the distributed binary is
   pure-Rust with no native audio dependency.
+- **Cross-BBS connection layer** — the door talks to the caller over whatever the
+  BBS provides: an inherited socket named in a **DOOR32.SYS** dropfile (the
+  Windows-BBS norm, where the handle is a Winsock `SOCKET`, not an fd), or stdio.
+  Its own input decoder and raw output replace a console-only terminal library, so
+  it works the same on a Unix pty, a Windows BBS socket, or a redirected pipe.
 - **CP437 output layer** — the menu/UI Unicode glyphs are emitted as CP437 bytes
-  (e.g. the `0xDF` half-block), which is what Synchronet expects from a door;
+  (e.g. the `0xDF` half-block), which is what BBS terminals expect from a door;
   raw UTF-8 would garble on both CP437 and UTF-8 clients.
 - **Door-friendly launch** — flags work without a positional ROM (the door is
-  launched as `terminal_gameboy --mute --ansi-music --user %4` with no ROM), and
-  the emulator drops back to the menu on quit instead of exiting the door.
+  launched with no ROM and shows its browser), it reads the caller's identity from
+  the dropfile, and drops back to the menu on quit instead of exiting.
 - **ROM browser rebuilt for large libraries** — type-ahead jump, a Game Boy /
   Game Boy Color / All filter, wider names with a GB/GBC type tag, and a
   directory picker.
-- **Per-user state** — render mode, audio, and filter preferences persist
-  per BBS user, and battery saves are isolated under `.saves/<user>/`.
+- **Per-user state** — render mode, sound, and filter preferences persist per BBS
+  user, and battery saves are isolated under `.saves/<user>/`.
 - **Link backpressure pacing** — the transmit frame rate is capped (default
   20 fps, `--fps N`) and frames are skipped when a slow/congested link can't keep
   up, so the door degrades gracefully instead of flooding the connection.
-- **Live resize over a door pty** — a Synchronet door's pty winsize is frozen at
-  launch, so terminal size is probed via a cursor-position report rather than
-  `SIGWINCH`.
+- **Live resize** — a door connection delivers no `SIGWINCH`/resize events and a
+  door pty's size is frozen at launch, so terminal size is tracked by probing with
+  a cursor-position report.
 
 ## Install (sysops)
 
@@ -52,41 +59,50 @@ Prebuilt, dependency-free binaries are attached to each
 (x86_64 / i686), macOS (arm64 / x86_64), and FreeBSD (x86_64). No `libasound2` or
 other runtime libs required.
 
-1. Download the archive for your platform and unpack it into your Synchronet
-   `xtrn/gb/` directory (so you have `xtrn/gb/terminal_gameboy`).
-2. Drop your own legally-obtained `.gb` / `.gbc` ROMs into `xtrn/gb/roms/`.
-3. Add the door — either via SCFG → External Programs, or by pasting the stanza
-   from [`xtrn.ini.example`](xtrn.ini.example) into `ctrl/xtrn.ini` — then recycle
-   the BBS.
+1. Unpack the archive for your platform into a directory under your BBS's external
+   programs (e.g. `xtrn/gb/`), so you have `…/gb/terminal_gameboy`.
+2. Drop your own legally-obtained `.gb` / `.gbc` ROMs into a `roms/` folder beside
+   the binary.
+3. Add the door in your BBS's door/external-program config with one of the
+   command lines below; see [`xtrn.ini.example`](xtrn.ini.example) for ready-to-paste
+   stanzas. Recycle/restart the BBS.
 
 Verify a download against `SHA256SUMS.txt` from the release.
 
 ## Running as a door
 
-Configured in Synchronet via SCFG (`[prog:GAMES:GB]` in `ctrl/xtrn.ini`); a
-ready-to-paste stanza is in [`xtrn.ini.example`](xtrn.ini.example):
+How the door reaches the caller depends on your BBS:
 
-```
-cmd=./terminal_gameboy --mute --ansi-music --user %4
-startup_dir=../xtrn/gb
-```
+- **stdio BBSes** (Synchronet and others that connect a door over stdin/stdout):
+  ```
+  ./terminal_gameboy --mute --ansi-music --user %4
+  ```
+  `%4` is Synchronet's specifier for the zero-padded user number (use your BBS's
+  equivalent), which keys per-user saves and preferences.
 
-`%4` expands to the zero-padded BBS user number, which keys per-user saves and
-preferences. ROMs live in `roms/` next to the binary (gitignored — provide your
-own legally obtained `.gb`/`.gbc` files). The **sound mode (Off / ANSI / APC)**
-is chosen by the caller in the menu and persists per user; `--ansi-music` enables
-the ANSI option.
+- **DOOR32.SYS BBSes** (EleBBS, Mystic, Windows BBSes, …) hand the door an
+  inherited socket via a dropfile — pass its path with `--dropfile`. The user
+  identity is read from the dropfile, so no `--user` is needed:
+  ```
+  terminal_gameboy.exe --mute --ansi-music --dropfile <path-to-DOOR32.SYS>
+  ```
+
+ROMs live in `roms/` next to the binary (gitignored — provide your own). The
+**sound mode (Off / ANSI / APC)** is chosen by the caller in the menu and persists
+per user; `--ansi-music` enables the ANSI option, APC streams full PCM to terminals
+that support SyncTERM audio APCs.
 
 ### Door options
 
-| Flag           | Description                                                  |
-| -------------- | ------------------------------------------------------------ |
-| `--mute`       | Never open a PCM device (required on a headless host)        |
-| `--ansi-music` | Approximate the lead voice via SyncTERM ANSI music           |
-| `--user <id>`  | Per-user key for saves + preferences (Synchronet `%4`)       |
-| `--fps <n>`    | Transmit frame-rate cap, 5–60 (default 20)                   |
-| `--block`      | Force Unicode half-block rendering                           |
-| `--ascii`      | Force ASCII-art rendering                                    |
+| Flag                | Description                                                   |
+| ------------------- | ------------------------------------------------------------- |
+| `--dropfile <path>` | DOOR32.SYS dropfile: use its inherited socket + user identity |
+| `--user <id>`       | Per-user key for saves + preferences (e.g. Synchronet `%4`)   |
+| `--mute`            | Never open a local sound device (required on a headless host) |
+| `--ansi-music`      | Allow ANSI-music sound (caller still picks Off/ANSI/APC)      |
+| `--fps <n>`         | Transmit frame-rate cap, 5–60 (default 20)                    |
+| `--block`           | Force Unicode half-block rendering                            |
+| `--ascii`           | Force ASCII-art rendering                                     |
 
 ## Building
 

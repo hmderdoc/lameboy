@@ -1,9 +1,7 @@
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    style::{Color, Print, SetBackgroundColor, SetForegroundColor, ResetColor},
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    cursor::MoveTo,
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    terminal::{Clear, ClearType},
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +10,9 @@ use std::thread;
 
 use crate::config;
 use crate::cp437::Cp437Writer;
+use crate::keys::{Input, Key};
 use crate::renderer::RenderMode;
+use crate::term::Term;
 
 /// Configuration selected from the menu
 pub struct MenuConfig {
@@ -236,17 +236,17 @@ const COLOR_SPAN: usize = 12;
 
 /// Play the GBC-style startup animation on the actual title position
 fn play_startup_animation(stdout: &mut impl Write) -> io::Result<()> {
-    execute!(stdout, Clear(ClearType::All))?;
+    emit!(stdout, Clear(ClearType::All))?;
     
     // Draw the border first (same position as menu)
-    execute!(stdout, SetForegroundColor(BORDER_COLOR))?;
-    execute!(stdout, MoveTo(2, 0), Print(format!("╔{}╗", "═".repeat(LOGO_WIDTH))))?;
-    execute!(stdout, MoveTo(2, (LOGO_LINES.len() + 1) as u16), Print(format!("╚{}╝", "═".repeat(LOGO_WIDTH))))?;
+    emit!(stdout, SetForegroundColor(BORDER_COLOR))?;
+    emit!(stdout, MoveTo(2, 0), Print(format!("╔{}╗", "═".repeat(LOGO_WIDTH))))?;
+    emit!(stdout, MoveTo(2, (LOGO_LINES.len() + 1) as u16), Print(format!("╚{}╝", "═".repeat(LOGO_WIDTH))))?;
     
     // Draw side borders
     for i in 0..LOGO_LINES.len() {
-        execute!(stdout, MoveTo(2, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
-        execute!(stdout, MoveTo((3 + LOGO_WIDTH) as u16, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
+        emit!(stdout, MoveTo(2, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
+        emit!(stdout, MoveTo((3 + LOGO_WIDTH) as u16, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
     }
     stdout.flush()?;
     
@@ -259,12 +259,12 @@ fn play_startup_animation(stdout: &mut impl Write) -> io::Result<()> {
     for sweep_col in 0..total_width {
         // Draw all logo lines with the color sweep
         for (line_idx, line) in LOGO_LINES.iter().enumerate() {
-            execute!(stdout, MoveTo(3, (line_idx + 1) as u16))?;
+            emit!(stdout, MoveTo(3, (line_idx + 1) as u16))?;
             
             for (char_idx, ch) in line.chars().enumerate() {
                 if char_idx > sweep_col {
                     // Not yet reached by sweep - invisible (print space to blend with background)
-                    execute!(stdout, Print(' '))?;
+                    emit!(stdout, Print(' '))?;
                 } else {
                     // Calculate which color in the cycle based on distance from sweep
                     // Each color spans COLOR_SPAN characters for a longer rainbow trail
@@ -277,7 +277,7 @@ fn play_startup_animation(stdout: &mut impl Write) -> io::Result<()> {
                         GBC_BLUE
                     };
                     
-                    execute!(stdout, SetForegroundColor(color), Print(ch))?;
+                    emit!(stdout, SetForegroundColor(color), Print(ch))?;
                 }
             }
         }
@@ -288,7 +288,7 @@ fn play_startup_animation(stdout: &mut impl Write) -> io::Result<()> {
     
     // Final frame: everything in solid blue
     for (line_idx, line) in LOGO_LINES.iter().enumerate() {
-        execute!(
+        emit!(
             stdout,
             MoveTo(3, (line_idx + 1) as u16),
             SetForegroundColor(GBC_BLUE),
@@ -459,45 +459,46 @@ fn scan_for_roms(dir: &Path) -> Vec<PathBuf> {
 /// `user` is an optional per-user key (the BBS user number) used to load and
 /// persist that caller's render/audio/filter preferences. `animate` controls
 /// whether the GBC startup sweep plays (skipped when returning from a game).
-pub fn show_menu(user: Option<&str>, animate: bool) -> io::Result<Option<MenuConfig>> {
-    // Wrap stdout so the menu's Unicode glyphs are emitted as CP437, matching
-    // what Synchronet expects from a door. (See cp437.rs / PATCH-NOTES.md.)
-    let mut stdout = Cp437Writer::new(io::stdout());
+pub fn show_menu(
+    term: &mut dyn Term,
+    input: &mut Input,
+    user: Option<&str>,
+    animate: bool,
+) -> io::Result<Option<MenuConfig>> {
     let mut state = MenuState::new(user);
 
-    // Setup terminal
-    terminal::enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
-
-    // Play the GBC-style startup animation (first entry only)
+    // Play the GBC-style startup animation (first entry only). The alternate
+    // screen / raw mode are owned by the caller and shared with the game.
     if animate {
-        play_startup_animation(&mut stdout)?;
+        let mut w = Cp437Writer::new(&mut *term);
+        play_startup_animation(&mut w)?;
     }
 
-    let result = run_menu_loop(&mut stdout, &mut state);
-    
-    // Cleanup terminal
-    execute!(stdout, Show, LeaveAlternateScreen)?;
-    terminal::disable_raw_mode()?;
-    
-    result
+    run_menu_loop(term, input, &mut state)
 }
 
-fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<Option<MenuConfig>> {
+fn run_menu_loop(
+    term: &mut dyn Term,
+    input: &mut Input,
+    state: &mut MenuState,
+) -> io::Result<Option<MenuConfig>> {
     // Tracks the last keystroke time so the type-ahead buffer can reset after
     // a pause. Starts far enough in the past that the first keypress is fresh.
     let mut last_key = Instant::now() - TYPEAHEAD_RESET * 2;
 
     loop {
-        draw_menu(stdout, state)?;
-
-        // Wait for input
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
+        // Draw through a CP437 adapter over the shared terminal, then release the
+        // borrow so we can read input from the same terminal.
+        {
+            let mut stdout = Cp437Writer::new(&mut *term);
+            draw_menu(&mut stdout, state)?;
         }
+
+        // Wait for a key (None = the caller hung up).
+        let key = match input.wait(term)? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
 
         // ── Game-list type-ahead ────────────────────────────────────────────
         // While the game list is focused, printable keys drive an incremental
@@ -505,8 +506,8 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
         // trip the "Z = confirm" shortcut). Enter still confirms, Esc backs
         // out, and the arrows/Tab still navigate.
         if state.current_section == MenuSection::GameList {
-            match key.code {
-                KeyCode::Char(c) if !c.is_control() => {
+            match key {
+                Key::Char(c) if !c.is_control() => {
                     if last_key.elapsed() > TYPEAHEAD_RESET {
                         state.typeahead.clear();
                     }
@@ -515,7 +516,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                     state.typeahead_jump();
                     continue;
                 }
-                KeyCode::Backspace => {
+                Key::Backspace => {
                     state.typeahead.pop();
                     last_key = Instant::now();
                     state.typeahead_jump();
@@ -525,14 +526,14 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
             }
         }
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+        match key {
+            Key::Char('q') | Key::Char('Q') | Key::Esc => {
                 return Ok(None);
             }
-            KeyCode::Char('x') | KeyCode::Char('X') => {
+            Key::Char('x') | Key::Char('X') => {
                 return Ok(None);
             }
-            KeyCode::Up => {
+            Key::Up => {
                 if state.current_section == MenuSection::GameList && !state.filtered.is_empty() {
                     if state.selected_rom_index > 0 {
                         state.selected_rom_index -= 1;
@@ -546,7 +547,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                     state.current_section = state.current_section.prev();
                 }
             }
-            KeyCode::Down => {
+            Key::Down => {
                 if state.current_section == MenuSection::GameList && !state.filtered.is_empty() {
                     if state.selected_rom_index + 1 < state.filtered.len() {
                         state.selected_rom_index += 1;
@@ -560,16 +561,16 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                     state.current_section = state.current_section.next();
                 }
             }
-            KeyCode::Tab => {
+            Key::Tab => {
                 state.typeahead.clear();
                 state.current_section = state.current_section.next();
             }
-            KeyCode::BackTab => {
+            Key::BackTab => {
                 state.typeahead.clear();
                 state.current_section = state.current_section.prev();
             }
             // Left/Right and Space (Select): Toggle options
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+            Key::Left | Key::Right | Key::Char(' ') => {
                 match state.current_section {
                     MenuSection::RenderMode => {
                         state.render_mode = match state.render_mode {
@@ -579,7 +580,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                         state.persist_prefs();
                     }
                     MenuSection::Audio => {
-                        state.sound = if key.code == KeyCode::Left {
+                        state.sound = if key == Key::Left {
                             state.sound.prev()
                         } else {
                             state.sound.next()
@@ -587,7 +588,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                         state.persist_prefs();
                     }
                     MenuSection::Filter => {
-                        state.filter = if key.code == KeyCode::Left {
+                        state.filter = if key == Key::Left {
                             state.filter.prev()
                         } else {
                             state.filter.next()
@@ -599,7 +600,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                 }
             }
             // Z (A button) or Enter (Start): Select/Confirm
-            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Enter => {
+            Key::Char('z') | Key::Char('Z') | Key::Enter => {
                 match state.current_section {
                     MenuSection::GameList => {
                         if let Some(rom_path) = state.selected_rom().cloned() {
@@ -611,7 +612,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                         }
                     }
                     MenuSection::RomsDirectory => {
-                        if let Some(chosen) = pick_directory(stdout, &state.roms_dir)? {
+                        if let Some(chosen) = pick_directory(term, input, &state.roms_dir)? {
                             state.roms_dir = chosen.clone();
                             state.refresh_roms();
                             // Persist the chosen directory alongside current prefs
@@ -644,7 +645,7 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
                     }
                 }
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
+            Key::Char('r') | Key::Char('R') => {
                 state.refresh_roms();
             }
             _ => {}
@@ -653,28 +654,28 @@ fn run_menu_loop(stdout: &mut impl Write, state: &mut MenuState) -> io::Result<O
 }
 
 fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
-    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+    emit!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
     
     // Draw top border
-    execute!(stdout, SetForegroundColor(BORDER_COLOR))?;
-    execute!(stdout, MoveTo(2, 0), Print(format!("╔{}╗", "═".repeat(LOGO_WIDTH))))?;
+    emit!(stdout, SetForegroundColor(BORDER_COLOR))?;
+    emit!(stdout, MoveTo(2, 0), Print(format!("╔{}╗", "═".repeat(LOGO_WIDTH))))?;
     
     // Draw logo in solid blue (matching the GBC startup end state)
     for (i, line) in LOGO_LINES.iter().enumerate() {
-        execute!(stdout, MoveTo(2, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
-        execute!(stdout, MoveTo(3, (i + 1) as u16), SetForegroundColor(GBC_BLUE), Print(line))?;
-        execute!(stdout, MoveTo((3 + LOGO_WIDTH) as u16, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
+        emit!(stdout, MoveTo(2, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
+        emit!(stdout, MoveTo(3, (i + 1) as u16), SetForegroundColor(GBC_BLUE), Print(line))?;
+        emit!(stdout, MoveTo((3 + LOGO_WIDTH) as u16, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
     }
     
     // Draw bottom border
-    execute!(stdout, SetForegroundColor(BORDER_COLOR))?;
-    execute!(stdout, MoveTo(2, (LOGO_LINES.len() + 1) as u16), Print(format!("╚{}╝", "═".repeat(LOGO_WIDTH))))?;
+    emit!(stdout, SetForegroundColor(BORDER_COLOR))?;
+    emit!(stdout, MoveTo(2, (LOGO_LINES.len() + 1) as u16), Print(format!("╚{}╝", "═".repeat(LOGO_WIDTH))))?;
     
     let menu_start_y = LOGO_LINES.len() as u16 + 3;
     
     // Draw settings section
-    execute!(stdout, MoveTo(4, menu_start_y))?;
-    execute!(stdout, SetForegroundColor(ACCENT_COLOR), Print("═══ Settings ═══"), ResetColor)?;
+    emit!(stdout, MoveTo(4, menu_start_y))?;
+    emit!(stdout, SetForegroundColor(ACCENT_COLOR), Print("═══ Settings ═══"), ResetColor)?;
     
     // Render Mode
     draw_option(
@@ -728,8 +729,8 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
     )?;
 
     // Games section header: active filter + how many ROMs match
-    execute!(stdout, MoveTo(4, menu_start_y + 7))?;
-    execute!(
+    emit!(stdout, MoveTo(4, menu_start_y + 7))?;
+    emit!(
         stdout,
         SetForegroundColor(ACCENT_COLOR),
         Print(format!("═══ Games: {} ({}) ═══", state.filter.label().trim(), state.filtered.len())),
@@ -737,7 +738,7 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
     )?;
     // Type-ahead indicator (shown while searching in the game list)
     if state.current_section == MenuSection::GameList && !state.typeahead.is_empty() {
-        execute!(
+        emit!(
             stdout,
             MoveTo(40, menu_start_y + 7),
             SetForegroundColor(HIGHLIGHT_FG),
@@ -754,14 +755,14 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         } else {
             "No games match this filter — change Filter above"
         };
-        execute!(
+        emit!(
             stdout,
             MoveTo(4, games_start_y),
             SetForegroundColor(DIM_COLOR),
             Print(msg),
             ResetColor
         )?;
-        execute!(
+        emit!(
             stdout,
             MoveTo(4, games_start_y + 1),
             SetForegroundColor(DIM_COLOR),
@@ -805,7 +806,7 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         // Scroll indicators
         let arrow_x: u16 = 65;
         if state.scroll_offset > 0 {
-            execute!(
+            emit!(
                 stdout,
                 MoveTo(arrow_x, games_start_y),
                 SetForegroundColor(ACCENT_COLOR),
@@ -814,7 +815,7 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
             )?;
         }
         if state.scroll_offset + visible_count < state.filtered.len() {
-            execute!(
+            emit!(
                 stdout,
                 MoveTo(arrow_x, games_start_y + visible_count as u16 - 1),
                 SetForegroundColor(ACCENT_COLOR),
@@ -826,11 +827,11 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
 
     // Help text
     let help_y = games_start_y + VISIBLE_ROWS as u16 + 2;
-    execute!(stdout, MoveTo(4, help_y), SetForegroundColor(DIM_COLOR))?;
-    execute!(stdout, Print("↑↓ Move   Type to jump   Z/Enter Play   ◄► Change setting   Esc Quit"))?;
-    execute!(stdout, MoveTo(4, help_y + 1), SetForegroundColor(DIM_COLOR))?;
-    execute!(stdout, Print("Filter: All / GB / GBC    Directory: Enter to browse, S to save    R Refresh"))?;
-    execute!(stdout, ResetColor)?;
+    emit!(stdout, MoveTo(4, help_y), SetForegroundColor(DIM_COLOR))?;
+    emit!(stdout, Print("↑↓ Move   Type to jump   Z/Enter Play   ◄► Change setting   Esc Quit"))?;
+    emit!(stdout, MoveTo(4, help_y + 1), SetForegroundColor(DIM_COLOR))?;
+    emit!(stdout, Print("Filter: All / GB / GBC    Directory: Enter to browse, S to save    R Refresh"))?;
+    emit!(stdout, ResetColor)?;
 
     stdout.flush()?;
     Ok(())
@@ -849,9 +850,9 @@ fn draw_rom_row(
 ) -> io::Result<()> {
     let prefix = if marker { " ▶ " } else { "   " };
     let name = format!("{}{:<width$} ", prefix, truncate_str(title, NAME_WIDTH), width = NAME_WIDTH);
-    execute!(stdout, MoveTo(4, y))?;
+    emit!(stdout, MoveTo(4, y))?;
     if highlight {
-        execute!(
+        emit!(
             stdout,
             SetBackgroundColor(HIGHLIGHT_BG),
             SetForegroundColor(HIGHLIGHT_FG),
@@ -862,7 +863,7 @@ fn draw_rom_row(
         )?;
     } else {
         let name_color = if marker { TEXT_COLOR } else { DIM_COLOR };
-        execute!(
+        emit!(
             stdout,
             SetForegroundColor(name_color),
             Print(name),
@@ -875,10 +876,10 @@ fn draw_rom_row(
 }
 
 fn draw_option(stdout: &mut impl Write, x: u16, y: u16, label: &str, value: &str, selected: bool) -> io::Result<()> {
-    execute!(stdout, MoveTo(x, y))?;
+    emit!(stdout, MoveTo(x, y))?;
     
     if selected {
-        execute!(
+        emit!(
             stdout,
             SetBackgroundColor(HIGHLIGHT_BG),
             SetForegroundColor(HIGHLIGHT_FG),
@@ -888,7 +889,7 @@ fn draw_option(stdout: &mut impl Write, x: u16, y: u16, label: &str, value: &str
             ResetColor
         )?;
     } else {
-        execute!(
+        emit!(
             stdout,
             SetForegroundColor(TEXT_COLOR),
             Print(format!(" {} ", label)),
@@ -965,7 +966,11 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
 /// pressed S (Set & Save), or None if they cancelled.
 ///
 /// Runs inside the already-active alternate screen / raw mode.
-fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Option<PathBuf>> {
+fn pick_directory(
+    term: &mut dyn Term,
+    input: &mut Input,
+    start_dir: &Path,
+) -> io::Result<Option<PathBuf>> {
     let mut current = start_dir.to_path_buf();
     let mut subdirs = list_subdirs(&current);
     // Index 0 = ".." (go up), indices 1.. = subdirs
@@ -980,10 +985,12 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
 
     loop {
         // ── Draw the browser ──────────────────────────────────────────────
-        execute!(stdout, Clear(ClearType::All))?;
+        {
+        let mut stdout = Cp437Writer::new(&mut *term);
+        emit!(stdout, Clear(ClearType::All))?;
 
         // Title bar
-        execute!(
+        emit!(
             stdout,
             MoveTo(2, 0),
             SetForegroundColor(ACCENT_COLOR),
@@ -992,7 +999,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
         )?;
 
         // Current path
-        execute!(
+        emit!(
             stdout,
             MoveTo(2, 1),
             SetForegroundColor(TEXT_COLOR),
@@ -1009,7 +1016,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
         } else {
             format!("  ({} ROM{} here ✓)", rom_count, if rom_count == 1 { "" } else { "s" })
         };
-        execute!(
+        emit!(
             stdout,
             MoveTo(2, 2),
             SetForegroundColor(if rom_count > 0 { ACCENT_COLOR } else { DIM_COLOR }),
@@ -1017,7 +1024,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
             ResetColor
         )?;
 
-        execute!(
+        emit!(
             stdout,
             MoveTo(2, 3),
             SetForegroundColor(BORDER_COLOR),
@@ -1046,9 +1053,9 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
 
             if entry_idx == 0 {
                 // ".." entry
-                execute!(stdout, MoveTo(2, y))?;
+                emit!(stdout, MoveTo(2, y))?;
                 if is_selected {
-                    execute!(
+                    emit!(
                         stdout,
                         SetBackgroundColor(HIGHLIGHT_BG),
                         SetForegroundColor(HIGHLIGHT_FG),
@@ -1056,7 +1063,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
                         ResetColor
                     )?;
                 } else {
-                    execute!(
+                    emit!(
                         stdout,
                         SetForegroundColor(DIM_COLOR),
                         Print("   ../  (go up)"),
@@ -1076,9 +1083,9 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
                     String::new()
                 };
 
-                execute!(stdout, MoveTo(2, y))?;
+                emit!(stdout, MoveTo(2, y))?;
                 if is_selected {
-                    execute!(
+                    emit!(
                         stdout,
                         SetBackgroundColor(HIGHLIGHT_BG),
                         SetForegroundColor(HIGHLIGHT_FG),
@@ -1086,7 +1093,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
                         ResetColor
                     )?;
                 } else {
-                    execute!(
+                    emit!(
                         stdout,
                         SetForegroundColor(TEXT_COLOR),
                         Print(format!("   {:<44}", truncate_str(&name, 44))),
@@ -1101,15 +1108,15 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
         // Scroll indicators
         let vis_end_y = list_start_y + max_visible.min(total_entries) as u16;
         if scroll > 0 {
-            execute!(stdout, MoveTo(64, list_start_y), SetForegroundColor(ACCENT_COLOR), Print("▲"), ResetColor)?;
+            emit!(stdout, MoveTo(64, list_start_y), SetForegroundColor(ACCENT_COLOR), Print("▲"), ResetColor)?;
         }
         if scroll + max_visible < total_entries {
-            execute!(stdout, MoveTo(64, vis_end_y - 1), SetForegroundColor(ACCENT_COLOR), Print("▼"), ResetColor)?;
+            emit!(stdout, MoveTo(64, vis_end_y - 1), SetForegroundColor(ACCENT_COLOR), Print("▼"), ResetColor)?;
         }
 
         // Separator
         let sep_y = list_start_y + max_visible as u16 + 1;
-        execute!(
+        emit!(
             stdout,
             MoveTo(2, sep_y),
             SetForegroundColor(BORDER_COLOR),
@@ -1120,7 +1127,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
         // Status / path-input line
         let status_y = sep_y + 1;
         if typing_path {
-            execute!(
+            emit!(
                 stdout,
                 MoveTo(2, status_y),
                 SetForegroundColor(ACCENT_COLOR),
@@ -1131,7 +1138,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
                 ResetColor
             )?;
         } else if let Some((ref msg, is_err)) = status_msg {
-            execute!(
+            emit!(
                 stdout,
                 MoveTo(2, status_y),
                 SetForegroundColor(if is_err {
@@ -1146,7 +1153,7 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
 
         // Help footer
         let help_y = status_y + 2;
-        execute!(
+        emit!(
             stdout,
             MoveTo(2, help_y),
             SetForegroundColor(DIM_COLOR),
@@ -1155,21 +1162,23 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
         )?;
 
         stdout.flush()?;
+        } // end draw scope — release the terminal borrow so we can read input
 
         // ── Handle input ──────────────────────────────────────────────────
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
+        {
+            let key = match input.wait(term)? {
+                Some(k) => k,
+                None => return Ok(None),
+            };
             status_msg = None; // clear status on next keypress
 
             if typing_path {
-                match key.code {
-                    KeyCode::Esc => {
+                match key {
+                    Key::Esc => {
                         typing_path = false;
                         typed_input.clear();
                     }
-                    KeyCode::Enter => {
+                    Key::Enter => {
                         // Confirm the typed path
                         let expanded = if typed_input.is_empty() {
                             None
@@ -1193,26 +1202,26 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
                         }
                         if !typing_path { typed_input.clear(); }
                     }
-                    KeyCode::Backspace => {
+                    Key::Backspace => {
                         typed_input.pop();
                     }
-                    KeyCode::Char(c) => {
+                    Key::Char(c) => {
                         typed_input.push(c);
                     }
                     _ => {}
                 }
             } else {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('x') | KeyCode::Char('X') => {
+                match key {
+                    Key::Esc | Key::Char('x') | Key::Char('X') => {
                         return Ok(None);
                     }
-                    KeyCode::Up => {
+                    Key::Up => {
                         if selected > 0 { selected -= 1; }
                     }
-                    KeyCode::Down => {
-                        if selected + 1 < total_entries { selected += 1; }
+                    Key::Down => {
+                        if selected + 1 < 1 + subdirs.len() { selected += 1; }
                     }
-                    KeyCode::Enter | KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    Key::Enter | Key::Char('z') | Key::Char('Z') => {
                         if selected == 0 {
                             // Go up
                             if let Some(parent) = current.parent().map(|p| p.to_path_buf()) {
@@ -1230,11 +1239,11 @@ fn pick_directory(stdout: &mut impl Write, start_dir: &Path) -> io::Result<Optio
                             scroll = 0;
                         }
                     }
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                    Key::Char('s') | Key::Char('S') => {
                         // Set & Save current directory
                         return Ok(Some(current));
                     }
-                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                    Key::Char('p') | Key::Char('P') => {
                         // Switch to manual path entry mode
                         typing_path = true;
                         typed_input.clear();

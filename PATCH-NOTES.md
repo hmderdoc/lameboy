@@ -43,7 +43,29 @@ proportion to write+flush stalls — the emulator keeps full speed and input sta
 responsive while frames drop. Mirrors the approach in the spectre door
 (`xtrn/spectre/docs/DESIGN.md`).
 
-## Patch: live resize over a door pty (`src/main.rs`)
+## Patch: cross-BBS I/O layer (`src/term.rs`, `src/door32.rs`, `src/keys.rs`, `src/out.rs`)
+
+Upstream uses a console-oriented terminal library (crossterm) for input, raw
+mode, and output. That assumes a local console and breaks as a door on BBSes
+that hand the connection over a socket rather than stdio (EleBBS, Mystic,
+Windows BBSes): no console for raw-mode input, and on Windows std even refuses
+to write our non-UTF-8 CP437 bytes to a console. So terminal I/O was reworked:
+
+- `term.rs` — a `Term` abstraction with a socket path and a stdio path per
+  platform. Unix wraps the inherited fd (or stdio) and sets termios raw on a tty;
+  Windows drives the inherited Winsock `SOCKET` with `recv`/`send` (it is not an
+  fd), or writes the raw stdout handle in stdio mode. Non-blocking reads, writes
+  that retry on EWOULDBLOCK (backpressure).
+- `door32.rs` — reads the DOOR32.SYS dropfile (`--dropfile`) for the comm handle
+  and the user identity.
+- `keys.rs` — decodes the raw byte stream into keys (arrow `ESC[`/`ESC O`
+  sequences, lone-ESC, CRLF, telnet IAC, cursor-position reports) in place of
+  crossterm's event reader. No key-up events arrive over a socket, so buttons
+  release on a timeout.
+- `out.rs` — emits crossterm `Command`s as ANSI to the `Term` on every platform
+  (crossterm's own macros fall back to the Windows console API).
+
+## Patch: live resize over a door connection (`src/main.rs`)
 
 A Synchronet door's pty winsize is frozen at launch and never gets `SIGWINCH`, so
 terminal size is probed ~1/sec via a cursor-position report (`ESC[6n`) instead of

@@ -173,7 +173,7 @@ impl Renderer {
         self.force_repaint = true;
     }
 
-    pub fn render(&mut self, fb: &FrameBuffer, out: &mut impl Write) -> io::Result<()> {
+    pub fn render<W: Write + ?Sized>(&mut self, fb: &FrameBuffer, out: &mut W) -> io::Result<()> {
         match self.config.mode {
             RenderMode::Block => self.render_block(fb, out),
             RenderMode::Ascii => self.render_ascii(fb, out),
@@ -270,7 +270,7 @@ impl Renderer {
         ASCII_CHARS[index]
     }
 
-    fn render_block(&mut self, fb: &FrameBuffer, out: &mut impl Write) -> io::Result<()> {
+    fn render_block<W: Write + ?Sized>(&mut self, fb: &FrameBuffer, out: &mut W) -> io::Result<()> {
         self.output_buffer.clear();
         self.ensure_cache();
 
@@ -341,7 +341,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn render_ascii(&mut self, fb: &FrameBuffer, out: &mut impl Write) -> io::Result<()> {
+    fn render_ascii<W: Write + ?Sized>(&mut self, fb: &FrameBuffer, out: &mut W) -> io::Result<()> {
         self.output_buffer.clear();
         self.ensure_cache();
 

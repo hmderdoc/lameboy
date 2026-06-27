@@ -73,7 +73,7 @@ impl ApcAudio {
 
     /// Emit every full chunk currently buffered. Call once per frame; flushes
     /// `out` so audio keeps flowing even when video frames are being skipped.
-    pub fn emit_ready(&mut self, out: &mut impl Write) -> io::Result<()> {
+    pub fn emit_ready<W: Write + ?Sized>(&mut self, out: &mut W) -> io::Result<()> {
         if !self.primed {
             // Hold output until the pre-roll cushion is built, then burst it all
             // out at once so the client FIFO starts with a lead.
@@ -94,7 +94,7 @@ impl ApcAudio {
     }
 
     /// Emit any remaining partial chunk (call on exit).
-    pub fn flush(&mut self, out: &mut impl Write) -> io::Result<()> {
+    pub fn flush<W: Write + ?Sized>(&mut self, out: &mut W) -> io::Result<()> {
         if !self.accum.is_empty() {
             let n = self.accum.len();
             self.emit_chunk(n, out)?;
@@ -103,7 +103,7 @@ impl ApcAudio {
         Ok(())
     }
 
-    fn emit_chunk(&mut self, n: usize, out: &mut impl Write) -> io::Result<()> {
+    fn emit_chunk<W: Write + ?Sized>(&mut self, n: usize, out: &mut W) -> io::Result<()> {
         let wav = encode_wav_mono(&self.accum[..n], OUT_RATE);
         self.accum.drain(0..n);
         let b64 = base64_encode(&wav);
@@ -137,7 +137,7 @@ fn f32_to_i16(v: f32) -> i16 {
     (v.clamp(-1.0, 1.0) * 32767.0) as i16
 }
 
-fn write_u8_dec(out: &mut impl Write, n: u8) -> io::Result<()> {
+fn write_u8_dec<W: Write + ?Sized>(out: &mut W, n: u8) -> io::Result<()> {
     let mut buf = [0u8; 3];
     let s = {
         let mut i = 3;

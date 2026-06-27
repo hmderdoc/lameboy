@@ -47,7 +47,7 @@ impl AnsiMusic {
 
     /// Sample the APU and emit music. Cheap to call every frame; internally rate
     /// limited to one tick. No-op when disabled.
-    pub fn update(&mut self, sound: &Sound, out: &mut impl Write) {
+    pub fn update<W: Write + ?Sized>(&mut self, sound: &Sound, out: &mut W) {
         if !self.enabled {
             return;
         }

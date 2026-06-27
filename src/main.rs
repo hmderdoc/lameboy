@@ -1,8 +1,13 @@
+#[macro_use]
+mod out;
 mod ansi_music;
 mod apc_audio;
 #[cfg(feature = "localaudio")]
 mod audio;
 mod config;
+mod door32;
+mod term;
+mod keys;
 mod cp437;
 mod framebuffer;
 mod input;
@@ -12,9 +17,7 @@ mod save;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use gameboy_core::{Gameboy, RTC, StepResult};
 #[cfg(feature = "localaudio")]
@@ -29,9 +32,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use audio::{AudioBuffer, GameboyAudioSource};
 use framebuffer::{FrameBuffer, GB_HEIGHT, GB_WIDTH};
 use input::map_key_to_button;
+use keys::{Input, Key};
 use menu::{show_menu, SoundMode};
 use renderer::{RenderConfig, RenderMode, Renderer};
 use save::{get_save_path, load_save, save_game};
+use term::Term;
 
 // Button count and index mapping (faster than HashMap for 8 buttons)
 const BUTTON_COUNT: usize = 8;
@@ -143,22 +148,31 @@ fn print_usage(program: &str) {
     eprintln!("  Q / Esc       Quit");
 }
 
-/// Query the terminal's *current* size by parking the cursor at the far corner
-/// and asking where it actually landed (cursor-position report via ESC[6n).
+/// Ask the terminal for its size: park the cursor at the far corner, then request
+/// a cursor-position report (`ESC[6n`). The reply (`ESC[row;colR`) is read back
+/// through the normal input path and surfaced by `Input::take_cursor`.
 ///
-/// Unlike `terminal::size()` (which reads the pty's ioctl winsize), this
-/// round-trips to the client, so it detects live resizes even inside a
-/// Synchronet door -- sbbs sets the door pty's winsize once at launch and never
-/// updates it, so the ioctl value and SIGWINCH-based Resize events are frozen.
-/// Returns (cols, rows), or None if the terminal didn't answer.
-fn query_terminal_size(stdout: &mut io::Stdout) -> Option<(u16, u16)> {
-    // The full frame repaint repositions the cursor afterwards, so no save/restore.
-    if execute!(stdout, MoveTo(9998, 9998)).is_err() {
-        return None;
+/// We probe rather than trust an ioctl/winsize because a door's pty size is
+/// frozen at launch (and an inherited socket has no winsize at all), so this
+/// round-trip is the only way to track the caller's real terminal size.
+fn send_size_probe<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+    emit!(term, MoveTo(9998, 9998))?;
+    term.write_all(b"\x1b[6n")?;
+    term.flush()
+}
+
+/// Extract the `--dropfile <path>` / `--dropfile=<path>` value (a DOOR32.SYS).
+fn parse_dropfile(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--dropfile=") {
+            return Some(v.to_string()).filter(|s| !s.is_empty());
+        }
+        if a == "--dropfile" {
+            return it.next().cloned().filter(|s| !s.is_empty());
+        }
     }
-    crossterm::cursor::position()
-        .ok()
-        .map(|(col, row)| (col + 1, row + 1))
+    None
 }
 
 /// Extract the `--user <id>` / `--user=<id>` value, if present. This is the
@@ -216,13 +230,20 @@ fn main() -> io::Result<()> {
     } else {
         None
     };
-    let user_id = parse_user(&args);
-    // Transmit frame-rate cap (Hz). Bounds bandwidth over a remote link; the
-    // emulator still runs at full speed regardless.
     let render_fps = parse_fps(&args).unwrap_or(DEFAULT_RENDER_FPS);
-    // First non-flag argument (if any) is the ROM path. (Skip the value that
-    // follows a value-taking flag (`--user`, `--fps`) so it isn't mistaken for a
-    // ROM path.)
+
+    // DOOR32.SYS dropfile: on a BBS that doesn't pass the connection via stdio
+    // (e.g. EleBBS/Mystic/Synchronet Win32), it names the inherited socket and
+    // the user. The per-user key is the explicit --user, else the dropfile's
+    // user number, else none.
+    let door = parse_dropfile(&args)
+        .as_deref()
+        .map(Path::new)
+        .and_then(door32::read);
+    let user_id = parse_user(&args).or_else(|| door.as_ref().and_then(|d| d.user_key()));
+
+    // First non-flag argument (if any) is the ROM path. Skip the value that
+    // follows a value-taking flag so it isn't mistaken for a ROM path.
     let positional_rom = {
         let mut found = None;
         let mut skip_next = false;
@@ -231,7 +252,7 @@ fn main() -> io::Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--user" || a == "--fps" {
+            if a == "--user" || a == "--fps" || a == "--dropfile" {
                 skip_next = true;
                 continue;
             }
@@ -243,53 +264,81 @@ fn main() -> io::Result<()> {
         found
     };
 
+    // Open the caller connection (inherited socket from the dropfile, or stdio)
+    // and enter the alternate screen once for the whole session. The Term owns
+    // raw mode and restores it on drop.
+    let mut term = term::open(door.as_ref())?;
+    let mut input = Input::new();
+    emit!(term, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
+    term.flush()?;
+
+    let result = run_session(
+        &mut *term,
+        &mut input,
+        positional_rom,
+        cli_mode,
+        force_mute,
+        ansi_music_flag,
+        user_id.as_deref(),
+        render_fps,
+    );
+
+    // Restore the screen no matter how the session ended; Term drop restores raw.
+    let _ = emit!(term, Show, LeaveAlternateScreen);
+    let _ = term.flush();
+    result
+}
+
+/// Run either a one-shot positional ROM or the interactive menu loop, over the
+/// already-open terminal. Quitting a game (Esc/Q) returns to the menu.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    term: &mut dyn Term,
+    input: &mut Input,
+    positional_rom: Option<String>,
+    cli_mode: Option<RenderMode>,
+    force_mute: bool,
+    ansi_music_flag: bool,
+    user_id: Option<&str>,
+    render_fps: f64,
+) -> io::Result<()> {
     if let Some(rom) = positional_rom {
-        // Explicit ROM on the command line — play it once and exit.
         let mode = cli_mode.unwrap_or(RenderMode::Ascii);
         return run_game(
-            &Path::new(&rom).to_path_buf(),
-            mode,
-            !force_mute,
-            ansi_music_flag,
-            false, // APC streaming is only meaningful from the menu/door path
-            user_id.as_deref(),
-            render_fps,
+            term, input, &Path::new(&rom).to_path_buf(), mode,
+            !force_mute, ansi_music_flag, false, user_id, render_fps,
         );
     }
 
-    // No ROM given: show the interactive menu in a loop, so quitting a game
-    // (Esc/Q) returns to the menu rather than exiting the door. --mute always
-    // wins over the menu's audio toggle so a muted door can never try to open
-    // an audio device; --block/--ascii (if passed) override the menu's mode.
     let mut animate = true;
     loop {
-        match show_menu(user_id.as_deref(), animate)? {
+        match show_menu(term, input, user_id, animate)? {
             Some(config) => {
                 let mode = cli_mode.unwrap_or(config.render_mode);
                 let want_apc = config.sound == SoundMode::Apc;
                 // Local PCM device (rodio) only for a non-APC, non-Off mode when
-                // not muted. The door runs --mute, so it never opens a device;
-                // APC instead streams PCM to the terminal.
+                // not muted. A headless door never opens a device; APC instead
+                // streams PCM to the caller.
                 let audio_enabled =
                     !force_mute && config.sound != SoundMode::Off && !want_apc;
-                // ANSI music plays when the door enabled it (--ansi-music) and the
-                // player selected ANSI mode.
                 let music_enabled = ansi_music_flag && config.sound == SoundMode::Ansi;
                 run_game(
-                    &config.rom_path, mode, audio_enabled, music_enabled,
-                    want_apc, user_id.as_deref(), render_fps,
+                    term, input, &config.rom_path, mode, audio_enabled,
+                    music_enabled, want_apc, user_id, render_fps,
                 )?;
-                // Only play the startup sweep on first entry, not after each game.
                 animate = false;
             }
-            None => return Ok(()), // User quit the menu
+            None => return Ok(()),
         }
     }
 }
 
 /// Run a single ROM to completion. Returns when the player quits the game
 /// (Esc/Q), at which point the caller decides whether to re-show the menu.
+#[allow(clippy::too_many_arguments)]
 fn run_game(
+    term: &mut dyn Term,
+    input: &mut Input,
     rom_path: &Path,
     mode: RenderMode,
     audio_enabled: bool,
@@ -335,21 +384,16 @@ fn run_game(
     #[cfg(feature = "localaudio")]
     let mut pre_buffer_frames = if audio_enabled { 3 } else { 0 };
 
-    let mut stdout = io::stdout();
-
-    // Setup terminal
-    terminal::enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
+    // The alternate screen and raw mode are owned by the caller (main) and shared
+    // with the menu. Just clear for this game; start from a sane default size and
+    // let the live probe below refine it from the caller's real terminal.
+    emit!(term, Clear(ClearType::All))?;
 
     let mut framebuffer = FrameBuffer::new(GB_WIDTH, GB_HEIGHT);
-
     let config = RenderConfig { mode };
     let mut renderer = Renderer::new(config);
-
-    // Fit the game to the current terminal size
-    if let Ok((cols, rows)) = terminal::size() {
-        renderer.update_dimensions(cols, rows);
-    }
+    renderer.update_dimensions(80, 24);
+    let _ = send_size_probe(&mut *term);
 
     // Use precise floating-point duration for accurate 60 FPS (16.667ms, not 16ms).
     // This paces the *emulator* — the game always runs at full Game Boy speed.
@@ -379,11 +423,10 @@ fn run_game(
     let mut frame_count = 0u32;
     let mut fps_timer = Instant::now();
 
-    // Live-resize polling: ask the terminal for its size periodically, since a
-    // Synchronet door never gets SIGWINCH/Resize events (see query_terminal_size).
+    // Live-resize polling: a door connection delivers no SIGWINCH/resize events,
+    // so we periodically probe the terminal for its size (see send_size_probe).
     let mut size_timer = Instant::now();
-    let mut last_size = terminal::size().unwrap_or((0, 0));
-    let mut resize_probe_enabled = true;
+    let mut last_size = (80u16, 24u16);
 
     // ANSI-music engine: approximates the lead pulse channel via terminal beeps.
     let mut ansi = ansi_music::AnsiMusic::new(music_enabled);
@@ -400,19 +443,15 @@ fn run_game(
     };
 
     let mut running = true;
-    // Track when each button was last seen (press or repeat event)
-    // Using fixed array instead of HashMap - faster for 8 buttons
+    // Track when each button was last seen, to release it on timeout.
     let mut button_last_seen: [Option<Instant>; BUTTON_COUNT] = [None; BUTTON_COUNT];
-    // Detect if terminal supports release events (Ghostty, kitty, etc.)
-    let mut terminal_supports_release = false;
-    // Fallback timeout for terminals without release support (Terminal.app, etc.)
-    // Needs to be long enough to span keyboard repeat gaps (~150ms is safe)
+    // No key-up events arrive over a BBS connection, so buttons release by
+    // timeout — long enough to span auto-repeat gaps (~150ms).
     let button_timeout = Duration::from_millis(150);
 
     while running {
-
-        // Only use timeout-based release for terminals that don't support release events
-        if !terminal_supports_release {
+        // Release any button not seen within the timeout.
+        {
             use gameboy_core::Button;
             const ALL_BUTTONS: [Button; BUTTON_COUNT] = [
                 Button::A, Button::B, Button::Start, Button::Select,
@@ -429,48 +468,23 @@ fn run_game(
             }
         }
 
-        // Process input events
-        while event::poll(Duration::from_millis(0))? {
-            match event::read()? {
-                Event::Resize(cols, rows) => {
-                    // Terminal was resized (e.g., zoom in/out) — refit and clear
-                    renderer.update_dimensions(cols, rows);
+        // Input: decode whatever arrived this frame from the connection.
+        for key in input.poll(term)? {
+            match key {
+                Key::Esc | Key::Char('q') | Key::Char('Q') => {
+                    running = false;
+                    break;
                 }
-                Event::Key(key_event) => {
-                    // Handle quit keys
-                    if key_event.code == KeyCode::Char('q')
-                        || key_event.code == KeyCode::Char('Q')
-                        || key_event.code == KeyCode::Esc
-                    {
-                        running = false;
-                        break;
-                    }
-
-                    // Map to gameboy button and handle press/repeat
-                    if let Some(button) = map_key_to_button(key_event.code) {
-                    let idx = button_index(button);
-                    match key_event.kind {
-                        KeyEventKind::Press | KeyEventKind::Repeat => {
-                            // Update last seen time (used for fallback timeout)
-                            let is_new = button_last_seen[idx].is_none();
-                            button_last_seen[idx] = Some(Instant::now());
-
-                            // Only call press_button if this is a new press
-                            if is_new {
-                                gameboy.press_button(button);
-                            }
-                        }
-                        KeyEventKind::Release => {
-                            // Terminal supports release events! Use them directly.
-                            terminal_supports_release = true;
-                            if button_last_seen[idx].take().is_some() {
-                                gameboy.release_button(button);
-                            }
+                k => {
+                    if let Some(button) = map_key_to_button(k) {
+                        let idx = button_index(button);
+                        let is_new = button_last_seen[idx].is_none();
+                        button_last_seen[idx] = Some(Instant::now());
+                        if is_new {
+                            gameboy.press_button(button);
                         }
                     }
                 }
-                }
-                _ => {} // Ignore other events (mouse, focus, etc.)
             }
         }
 
@@ -478,26 +492,19 @@ fn run_game(
             break;
         }
 
-        // Poll for a live terminal resize (~1/sec). The door's pty winsize is
-        // frozen at launch, so we ask the terminal directly rather than wait for
-        // a Resize event that will never come. Skip the probe while the link is
-        // saturated — its blocking write would stall the loop just like a frame.
-        if resize_probe_enabled
-            && !pace.skipping()
-            && size_timer.elapsed() >= Duration::from_millis(1000)
-        {
-            size_timer = Instant::now();
-            match query_terminal_size(&mut stdout) {
-                Some(size) if size.0 > 0 && size.1 > 0 => {
-                    if size != last_size {
-                        last_size = size;
-                        renderer.update_dimensions(size.0, size.1);
-                    }
-                }
-                // Terminal didn't answer the position query: stop probing so a
-                // non-responsive client can't cost us a round-trip every second.
-                _ => resize_probe_enabled = false,
+        // Apply a terminal-size report if the probe was answered (row;col -> cols,rows).
+        if let Some((row, col)) = input.take_cursor() {
+            let size = (col, row);
+            if size.0 > 0 && size.1 > 0 && size != last_size {
+                last_size = size;
+                renderer.update_dimensions(size.0, size.1);
             }
+        }
+        // Re-probe ~1/sec, but not while the link is saturated (its blocking
+        // write would stall the loop just like a frame).
+        if !pace.skipping() && size_timer.elapsed() >= Duration::from_millis(1000) {
+            size_timer = Instant::now();
+            let _ = send_size_probe(&mut *term);
         }
 
         // Advance the simulation to wall-clock: run every GB frame whose time
@@ -537,7 +544,7 @@ fn run_game(
         // Ship any full APC audio chunks now, regardless of video pacing, so
         // sound keeps flowing even while frames are being skipped.
         if let Some(a) = apc.as_mut() {
-            a.emit_ready(&mut stdout)?;
+            a.emit_ready(&mut *term)?;
         }
 
         // Start local audio playback after pre-buffering (localaudio builds only;
@@ -570,8 +577,8 @@ fn run_game(
 
                 // ANSI music first (small), then the frame. Both go through the
                 // same blocking writes, so a stalled link is measured below.
-                ansi.update(gameboy.get_sound(), &mut stdout);
-                renderer.render(&framebuffer, &mut stdout)?;
+                ansi.update(gameboy.get_sound(), &mut *term);
+                renderer.render(&framebuffer, &mut *term)?;
 
                 // FPS overlay (transmitted frame rate), at most once/sec.
                 frame_count += 1;
@@ -580,9 +587,9 @@ fn run_game(
                     let fps = frame_count as f32 / fps_elapsed.as_secs_f32();
                     frame_count = 0;
                     fps_timer = Instant::now();
-                    execute!(stdout, MoveTo(0, renderer.fps_row()))?;
-                    write!(stdout, "{}FPS: {:5.1}  {}", FPS_COLOR, fps, RESET)?;
-                    stdout.flush()?;
+                    emit!(term, MoveTo(0, renderer.fps_row()))?;
+                    write!(term, "{}FPS: {:5.1}  {}", FPS_COLOR, fps, RESET)?;
+                    term.flush()?;
                 }
 
                 // Charge the write+flush time to the pacer: if it overran the
@@ -600,14 +607,10 @@ fn run_game(
         }
     }
 
-    // Emit any trailing partial audio chunk before tearing down.
+    // Emit any trailing partial audio chunk before returning to the menu.
     if let Some(a) = apc.as_mut() {
-        let _ = a.flush(&mut stdout);
+        let _ = a.flush(&mut *term);
     }
-
-    // Cleanup terminal
-    execute!(stdout, Show, LeaveAlternateScreen)?;
-    terminal::disable_raw_mode()?;
 
     // Save game on exit
     match save_game(&gameboy, rom_path, user_id) {

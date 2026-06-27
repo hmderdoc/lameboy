@@ -1,6 +1,6 @@
 //! UTF-8 -> CP437 output adapter.
 //!
-//! Synchronet ships external-program (door) output to the user as CP437: bytes
+//! BBS terminals receive door output as CP437: bytes
 //! pass through unchanged to CP437 clients and are mapped up to Unicode for
 //! UTF-8 clients. A door that emits raw UTF-8 therefore garbles on every client.
 //!
