@@ -77,10 +77,19 @@ fn sanitize_key(s: &str) -> String {
         .to_string()
 }
 
-/// Parse a DOOR32.SYS file. Returns None if it can't be read or the first two
-/// (required) lines don't parse.
+/// Read and parse a DOOR32.SYS. `path` may be the file itself, OR a directory
+/// that contains it — some BBS configs pass only the drop-file directory (e.g.
+/// Synchronet's `--dropfile .\`), in which case we look for DOOR32.SYS inside.
+/// Returns None if nothing readable is found or the first two (required) lines
+/// don't parse.
 pub fn read(path: &Path) -> Option<Door32> {
-    parse(&std::fs::read_to_string(path).ok()?)
+    let text = std::fs::read_to_string(path).ok().or_else(|| {
+        // `path` wasn't a readable file (likely a directory) — look inside it.
+        ["DOOR32.SYS", "door32.sys"]
+            .iter()
+            .find_map(|name| std::fs::read_to_string(path.join(name)).ok())
+    })?;
+    parse(&text)
 }
 
 fn parse(text: &str) -> Option<Door32> {
@@ -140,6 +149,18 @@ mod tests {
         // a real number still wins over the name
         let d3 = parse("2\n5\n0\nEleBBS\n7\nReal Name\nShurato\n10\n90\n1\n1\n").unwrap();
         assert_eq!(d3.user_key().as_deref(), Some("0007"));
+    }
+
+    #[test]
+    fn reads_dropfile_when_given_its_directory() {
+        // Synchronet-style `--dropfile .\` passes the directory, not the file.
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("lameboy_d32_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("DOOR32.SYS"), "2\r\n328\r\n0\r\nSBBS\r\n7\r\nReal\r\nShu\r\n100\r\n90\r\n1\r\n1\r\n").unwrap();
+        let d = read(&dir).expect("should find DOOR32.SYS inside the directory");
+        assert_eq!(d.socket(), Some(328));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -73,22 +73,57 @@ Verify a download against `SHA256SUMS.txt` from the release.
 
 ## Running as a door
 
-The command line stays short — the only argument that matters is how the caller
-is connected. Everything else has sane defaults (and a `lameboy.ini`, below):
+The only argument that matters is how the caller is connected; everything else
+has sane defaults (and a `lameboy.ini`, below). The two setups below cover most
+BBSes — the flag reference is further down.
 
-- **stdio BBSes** (Synchronet and others that connect a door over stdin/stdout):
-  ```
-  ./terminal_gameboy --user %4
-  ```
-  `%4` is Synchronet's specifier for the zero-padded user number (use your BBS's
-  equivalent); it keys per-user saves and preferences.
+### Synchronet
 
-- **DOOR32.SYS BBSes** (EleBBS, Mystic, Windows BBSes, …) hand the door an
-  inherited socket via a dropfile — pass its path, and the user identity comes
-  from the dropfile (no `--user` needed):
-  ```
-  terminal_gameboy.exe --dropfile <path-to-DOOR32.SYS>
-  ```
+Add it in SCFG → *External Programs* → *Online Programs*. On **Windows** the
+connection is a DOOR32.SYS socket; on **Unix** Synchronet usually connects the
+door over stdin/stdout (no dropfile — just pass `--user %4`).
+
+```
+                         gameboy
+  ┌─────────────────────────────────────────────────────────┐
+  │ Name ...................... Game Boy                      │
+  │ Internal Code ............. GAMEBOY                       │
+  │ Start-up Directory ........ c:\sbbs\xtrn\gb               │
+  │ Command Line .............. gb.exe --dropfile DOOR32.SYS  │
+  │ Native Executable ......... Yes                          │
+  │ Multiple Concurrent Users . Yes                          │
+  │ I/O Method ................ Socket                       │
+  │ BBS Drop File Type ........ DOOR32.SYS                   │
+  │ Place Drop File In ........ Start-up Directory           │
+  └─────────────────────────────────────────────────────────┘
+
+  Unix / stdio instead of a dropfile:   ./terminal_gameboy --user %!
+```
+
+Because the drop file is placed in the start-up directory (which is the door's
+working directory), `--dropfile DOOR32.SYS` finds it. `--user` is optional here —
+the user identity is read from the drop file.
+
+### EleBBS / Mystic / other DOOR32.SYS BBSes
+
+Configure a **native** door using the **socket** I/O method and a **DOOR32.SYS**
+drop file, then point `--dropfile` at it:
+
+```
+  Door type / executable ..... Native
+  I/O method ................. Socket
+  Drop file .................. DOOR32.SYS
+  Command line ............... terminal_gameboy --dropfile DOOR32.SYS
+                              (or the full path to the node's DOOR32.SYS)
+```
+
+`--dropfile` must resolve to the **DOOR32.SYS file** — the door reads the
+inherited socket handle from it. You may pass the file itself or the directory
+that contains it (e.g. `--dropfile .\`; the bare-directory form needs v0.4.1+).
+If the drop file can't be read, the door falls back to stdio — which a
+socket-mode door isn't connected to, so **its output never reaches the caller**
+(the tell-tale symptom: raw escape codes pile up on the server console while the
+user sees nothing).
 
 The **sound mode (Off / ANSI / APC)** is chosen by the caller in the menu and
 persists per user (APC streams full PCM to terminals that support SyncTERM audio
