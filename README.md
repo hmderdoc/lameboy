@@ -79,15 +79,16 @@ BBSes — the flag reference is further down.
 
 ### Synchronet
 
-Add it in SCFG → *External Programs* → *Online Programs*. The simplest setup
-uses the **Standard** I/O method (stdio) and `--user %4` — no drop file needed:
+Add it in SCFG → *External Programs* → *Online Programs*. The executable here is
+the released `terminal_gameboy.exe` (rename it to anything you like). The simplest
+setup uses the **Standard** I/O method (stdio) and `--user %4` — no drop file:
 
 ```
 [gameboy]
  1: Name ........................ Game Boy
  2: Internal Code ............... GAMEBOY
  3: Start-up Directory .......... c:\sbbs\xtrn\gb
- 4: Command Line ................ gb.exe --user %4
+ 4: Command Line ................ terminal_gameboy.exe --user %4
  5: Clean-up Command Line .......
  6: Execution Cost .............. None
  7: Access Requirements .........
@@ -101,16 +102,17 @@ uses the **Standard** I/O method (stdio) and `--user %4` — no drop file needed
 15: Pause After Execution ....... No
 16: Disable Local Display ....... No
 17: BBS Drop File Type .......... DOOR32.SYS
-18: Place Drop File In .......... Start-up Directory
+18: Place Drop File In .......... Node Directory
 19: Time Options...
 ```
 
 `%4` is the zero-padded user number; it keys per-user saves and preferences.
 
 **Prefer a socket?** Set line 11 `I/O Method` to **Socket** and line 4 to
-`gb.exe --dropfile DOOR32.SYS`. The drop file lands in the start-up directory
-(the door's working directory), so that relative path finds it; `--user` is then
-optional since the identity is read from the drop file.
+`terminal_gameboy.exe --dropfile %f`. Leave the drop file in the **Node
+Directory** (line 18); Synchronet expands `%f` to its full path, so the door
+finds it regardless of the working directory. `--user` is then optional — the
+identity is read from the drop file.
 
 ### EleBBS / Mystic / other DOOR32.SYS BBSes
 
