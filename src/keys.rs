@@ -214,25 +214,33 @@ impl Input {
         Ok(self.decoder.feed(&self.buf[..n]))
     }
 
-    /// Block until at least one key is available (or the connection closes,
-    /// returning None). Polls with a short sleep; resolves lone-ESC on idle.
-    pub fn wait(&mut self, term: &mut dyn crate::term::Term) -> std::io::Result<Option<Key>> {
+    /// Block until a key arrives, or until the terminal answers a size probe —
+    /// so the menu can re-layout to the real screen height without waiting for a
+    /// keystroke. Mirrors `wait`'s lone-ESC debounce.
+    pub fn wait_event(&mut self, term: &mut dyn crate::term::Term) -> std::io::Result<MenuEvent> {
         let mut empties = 0u32;
         loop {
+            if let Some((r, c)) = self.decoder.take_cursor() {
+                return Ok(MenuEvent::Resize(r, c));
+            }
             let n = term.read_available(&mut self.buf)?;
             if n > 0 {
                 let keys = self.decoder.feed(&self.buf[..n]);
                 if let Some(k) = keys.into_iter().next() {
-                    return Ok(Some(k));
+                    return Ok(MenuEvent::Key(k));
                 }
                 empties = 0;
             } else {
-                // After a couple of idle polls, a held ESC is really the Esc key.
                 empties += 1;
                 if empties >= 2 {
                     if let Some(k) = self.decoder.idle() {
-                        return Ok(Some(k));
+                        return Ok(MenuEvent::Key(k));
                     }
+                }
+                // ~1s with nothing happening: surface a tick so the menu can
+                // re-probe and pick up a resize that occurred while idle.
+                if empties >= 66 {
+                    return Ok(MenuEvent::Idle);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(15));
             }
@@ -242,6 +250,14 @@ impl Input {
     pub fn take_cursor(&mut self) -> Option<(u16, u16)> {
         self.decoder.take_cursor()
     }
+}
+
+/// What `Input::wait_event` returned: a keypress, the terminal's (rows, cols)
+/// from a size-probe reply, or an idle tick (~1s of no input).
+pub enum MenuEvent {
+    Key(Key),
+    Resize(u16, u16),
+    Idle,
 }
 
 #[cfg(test)]

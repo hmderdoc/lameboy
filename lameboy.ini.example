@@ -1,0 +1,19 @@
+; Lameboy door — sysop defaults.
+;
+; Copy to "lameboy.ini" next to the binary and edit. Everything here is
+; optional; a command-line flag (--roms, --fps, --ansi-music) overrides the
+; matching key. Per-call values (the DOOR32 dropfile path and the user id) are
+; NOT configured here — the BBS supplies those on the command line at launch.
+;
+; Lines starting with ; or # are comments.
+
+; ROM directory. Relative paths are resolved from the door's working directory.
+; Default: roms/ beside the binary.
+;roms = roms
+
+; Transmit frame-rate cap (clamped to 5-60). Lower it on slow links. Default 20.
+;fps = 20
+
+; Offer ANSI-music sound (the caller still picks Off / ANSI / APC in the menu).
+; Set false for a silent door / APC-only. Default true.
+;ansi_music = true

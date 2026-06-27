@@ -1,7 +1,8 @@
 use crossterm::{
     cursor::MoveTo,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType},
+    Command,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::thread;
 
 use crate::config;
 use crate::cp437::Cp437Writer;
-use crate::keys::{Input, Key};
+use crate::keys::{Input, Key, MenuEvent};
 use crate::renderer::RenderMode;
 use crate::term::Term;
 
@@ -21,8 +22,23 @@ pub struct MenuConfig {
     pub sound: SoundMode,
 }
 
-/// How many ROM rows are shown in the game list at once.
-const VISIBLE_ROWS: usize = 8;
+/// Fallback ROM-row count used until the terminal answers a size probe. The live
+/// count is derived from the real terminal height (see `visible_for`).
+const VISIBLE_ROWS: usize = 12;
+
+/// Row of the "Games:" header and the first ROM row. Everything above (the hint
+/// lines, the wordmark + settings band) is fixed height; the list below grows to
+/// fill whatever screen height the caller has.
+const GAMES_HEADER_Y: u16 = 9;
+const GAMES_START_Y: u16 = 10;
+
+/// ROM rows that fit under the header on a `term_rows`-tall screen (1 row of
+/// bottom margin), floored so the list is always usable.
+fn visible_for(term_rows: u16) -> usize {
+    (term_rows as usize)
+        .saturating_sub(GAMES_START_Y as usize + 1)
+        .max(4)
+}
 
 /// Width (in columns) of the ROM-name field in the game list.
 const NAME_WIDTH: usize = 52;
@@ -141,13 +157,62 @@ impl SoundMode {
     }
 }
 
+/// Terminal screen-size handling.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ScreenSize {
+    /// Use the caller's terminal as-is (the list fills whatever height it has).
+    Auto,
+    /// Ask the terminal to resize to the ideal size for the game render, and
+    /// restore the original size on exit. No-ops on terminals that ignore the
+    /// resize sequence (e.g. SyncTERM), where Auto behavior remains.
+    Best,
+}
+
+/// Ideal render size in character cells (≈1 char-row per 2 Game Boy pixels).
+pub const BEST_COLS: u16 = 172;
+pub const BEST_ROWS: u16 = 74;
+
+impl ScreenSize {
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Best,
+            Self::Best => Self::Auto,
+        }
+    }
+
+    fn prev(self) -> Self {
+        self.next()
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Best => "Best",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Best => "best",
+        }
+    }
+
+    fn from_code(s: &str) -> Self {
+        match s {
+            "best" => Self::Best,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Menu state
 struct MenuState {
     // Settings
     render_mode: RenderMode,
     sound: SoundMode,
     filter: RomFilter,
-    roms_dir: PathBuf,
+    screen: ScreenSize,
 
     // Per-user preference key (BBS user number); None for standalone use.
     user: Option<String>,
@@ -159,16 +224,24 @@ struct MenuState {
 
     // UI state
     current_section: MenuSection,
+    // Which settings row to return to when Tab jumps back from the game list,
+    // so focus is preserved instead of always snapping to the top setting.
+    last_settings: MenuSection,
     scroll_offset: usize,
+    // How many ROM rows currently fit, derived from the live terminal height.
+    visible_rows: usize,
     typeahead: String,
 }
 
+// The ROM directory is a sysop setting (config / --roms), NOT a caller-facing
+// option — a filesystem browser in the door would let any caller wander the
+// server's disk. So there's no RomsDirectory section.
 #[derive(Clone, Copy, PartialEq)]
 enum MenuSection {
     RenderMode,
     Audio,
     Filter,
-    RomsDirectory,
+    Screen,
     GameList,
 }
 
@@ -177,8 +250,8 @@ impl MenuSection {
         match self {
             Self::RenderMode => Self::Audio,
             Self::Audio => Self::Filter,
-            Self::Filter => Self::RomsDirectory,
-            Self::RomsDirectory => Self::GameList,
+            Self::Filter => Self::Screen,
+            Self::Screen => Self::GameList,
             Self::GameList => Self::RenderMode,
         }
     }
@@ -188,132 +261,150 @@ impl MenuSection {
             Self::RenderMode => Self::GameList,
             Self::Audio => Self::RenderMode,
             Self::Filter => Self::Audio,
-            Self::RomsDirectory => Self::Filter,
-            Self::GameList => Self::RomsDirectory,
+            Self::Screen => Self::Filter,
+            Self::GameList => Self::Screen,
         }
     }
 }
 
-// Colors - Navy/Blue theme inspired by GBC
-const HIGHLIGHT_BG: Color = Color::Rgb { r: 30, g: 60, b: 114 };   // Navy blue
-const HIGHLIGHT_FG: Color = Color::Rgb { r: 130, g: 180, b: 255 }; // Light blue
-const DIM_COLOR: Color = Color::Rgb { r: 80, g: 100, b: 140 };     // Muted blue-gray
-const TEXT_COLOR: Color = Color::Rgb { r: 200, g: 210, b: 230 };   // Light blue-white
-const ACCENT_COLOR: Color = Color::Rgb { r: 100, g: 200, b: 255 }; // Cyan accent
-const BORDER_COLOR: Color = Color::Rgb { r: 60, g: 90, b: 150 };   // Border blue
+// Colors — the original Game Boy (DMG) LCD palette: dark green ink on the pale
+// pea-green "screen". Emphasis comes from value (how dark), not hue, the way the
+// real hardware did it. Hex refs: CADC9F / 8bac0f / 306230 / 0f380f.
+const SCREEN_BG: Color = Color::Rgb { r: 202, g: 220, b: 159 }; // #CADC9F — LCD background
+const INK: Color = Color::Rgb { r: 15, g: 56, b: 15 };         // #0f380f — darkest
+const INK_MID: Color = Color::Rgb { r: 48, g: 98, b: 48 };     // #306230 — mid green
+const MOSS: Color = Color::Rgb { r: 139, g: 172, b: 15 };      // #8bac0f — light olive
+const LIME: Color = Color::Rgb { r: 155, g: 188, b: 15 };      // #9bbc0f — classic GB green
 
-// Logo lines (without border - we draw that separately)
-const LOGO_LINES: [&str; 12] = [
-    "  ████████╗███████╗██████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██╗     ",
-    "  ╚══██╔══╝██╔════╝██╔══██╗████╗ ████║██║████╗  ██║██╔══██╗██║     ",
-    "     ██║   █████╗  ██████╔╝██╔████╔██║██║██╔██╗ ██║███████║██║     ",
-    "     ██║   ██╔══╝  ██╔══██╗██║╚██╔╝██║██║██║╚██╗██║██╔══██║██║     ",
-    "     ██║   ███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║███████╗",
-    "     ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝",
-    "   ██████╗  █████╗ ███╗   ███╗███████╗██████╗  ██████╗ ██╗   ██╗   ",
-    "  ██╔════╝ ██╔══██╗████╗ ████║██╔════╝██╔══██╗██╔═══██╗╚██╗ ██╔╝   ",
-    "  ██║  ███╗███████║██╔████╔██║█████╗  ██████╔╝██║   ██║ ╚████╔╝    ",
-    "  ██║   ██║██╔══██║██║╚██╔╝██║██╔══╝  ██╔══██╗██║   ██║  ╚██╔╝     ",
-    "  ╚██████╔╝██║  ██║██║ ╚═╝ ██║███████╗██████╔╝╚██████╔╝   ██║      ",
-    "   ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═════╝  ╚═════╝    ╚═╝      ",
-];
+const HIGHLIGHT_BG: Color = INK;   // selected row: dark "pixel" bar...
+const HIGHLIGHT_FG: Color = LIME;  // ...with bright GB-green text
+const DIM_COLOR: Color = MOSS;     // secondary / receding text
+const TEXT_COLOR: Color = INK_MID; // primary body text
+const ACCENT_COLOR: Color = INK_MID; // headers
+const KEY_COLOR: Color = INK;      // emphasis (keys, wordmark, selection marker) — darkest pops
 
-const LOGO_WIDTH: usize = 70;
-
-// GBC startup colors (matching the actual GBC boot sequence)
-const GBC_BLUE: Color = Color::Rgb { r: 0, g: 0, b: 255 };
-const GBC_GREEN: Color = Color::Rgb { r: 0, g: 255, b: 0 };
-const GBC_MAGENTA: Color = Color::Rgb { r: 255, g: 0, b: 255 };
-const GBC_RED: Color = Color::Rgb { r: 255, g: 0, b: 0 };
-const GBC_YELLOW: Color = Color::Rgb { r: 255, g: 255, b: 0 };
-
-// The color cycle order for the sweep (yellow leads, blue trails)
-const GBC_CYCLE: [Color; 5] = [GBC_YELLOW, GBC_RED, GBC_MAGENTA, GBC_GREEN, GBC_BLUE];
-
-// How many characters each color spans in the rainbow trail
-// GBC shows ~85% rainbow coverage when sweep reaches end: 70 * 0.85 / 5 colors ≈ 12
-const COLOR_SPAN: usize = 12;
-
-/// Play the GBC-style startup animation on the actual title position
-fn play_startup_animation(stdout: &mut impl Write) -> io::Result<()> {
-    emit!(stdout, Clear(ClearType::All))?;
-    
-    // Draw the border first (same position as menu)
-    emit!(stdout, SetForegroundColor(BORDER_COLOR))?;
-    emit!(stdout, MoveTo(2, 0), Print(format!("╔{}╗", "═".repeat(LOGO_WIDTH))))?;
-    emit!(stdout, MoveTo(2, (LOGO_LINES.len() + 1) as u16), Print(format!("╚{}╝", "═".repeat(LOGO_WIDTH))))?;
-    
-    // Draw side borders
-    for i in 0..LOGO_LINES.len() {
-        emit!(stdout, MoveTo(2, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
-        emit!(stdout, MoveTo((3 + LOGO_WIDTH) as u16, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
+/// Reset to the menu's "normal" cell — dark ink on the LCD background. Used in
+/// place of `ResetColor`, which would clear the background to the terminal
+/// default and punch dark holes in the green screen.
+struct Normal;
+impl Command for Normal {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        SetForegroundColor(TEXT_COLOR).write_ansi(f)?;
+        SetBackgroundColor(SCREEN_BG).write_ansi(f)
     }
-    stdout.flush()?;
-    
-    thread::sleep(Duration::from_millis(200));
-    
-    // Animation: Color sweep from left to right across all logo lines
-    // Need extra width for the full rainbow trail to sweep through and settle
-    let total_width = LOGO_WIDTH + (GBC_CYCLE.len() * COLOR_SPAN);
-    
-    for sweep_col in 0..total_width {
-        // Draw all logo lines with the color sweep
-        for (line_idx, line) in LOGO_LINES.iter().enumerate() {
-            emit!(stdout, MoveTo(3, (line_idx + 1) as u16))?;
-            
-            for (char_idx, ch) in line.chars().enumerate() {
-                if char_idx > sweep_col {
-                    // Not yet reached by sweep - invisible (print space to blend with background)
-                    emit!(stdout, Print(' '))?;
-                } else {
-                    // Calculate which color in the cycle based on distance from sweep
-                    // Each color spans COLOR_SPAN characters for a longer rainbow trail
-                    let dist = sweep_col - char_idx;
-                    let color_index = dist / COLOR_SPAN;
-                    let color = if color_index < GBC_CYCLE.len() {
-                        GBC_CYCLE[color_index]
-                    } else {
-                        // After sweep passes, settle to blue
-                        GBC_BLUE
-                    };
-                    
-                    emit!(stdout, SetForegroundColor(color), Print(ch))?;
-                }
-            }
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        // ANSI-only door; the Windows console-API path is never taken.
+        Ok(())
+    }
+}
+const NORMAL: Normal = Normal;
+
+/// The wordmark is a 1-bit pixel bitmap (9 pixel rows tall, `#` = on). It's
+/// rendered with CP437 half-blocks — each character cell stacks two pixel rows
+/// (`█` both, `▀` upper, `▄` lower) — which doubles the vertical resolution and
+/// smooths the diagonals/curves that plain full blocks leave jagged.
+const LOGO_TEXT: &str = "LAME BOY";
+const LOGO_PX_H: usize = 9;
+
+fn logo_glyph(c: char) -> [&'static str; LOGO_PX_H] {
+    match c {
+        'L' => ["##   ", "##   ", "##   ", "##   ", "##   ", "##   ", "##   ", "#####", "#####"],
+        'A' => [" ### ", "## ##", "## ##", "## ##", "#####", "#####", "## ##", "## ##", "## ##"],
+        'M' => ["##   ##", "### ###", "## # ##", "##   ##", "##   ##", "##   ##", "##   ##", "##   ##", "##   ##"],
+        'E' => ["#####", "##   ", "##   ", "#### ", "#### ", "##   ", "##   ", "#####", "#####"],
+        'B' => ["#### ", "## ##", "## ##", "#### ", "#### ", "## ##", "## ##", "## ##", "#### "],
+        'O' => [" ### ", "## ##", "## ##", "## ##", "## ##", "## ##", "## ##", "## ##", " ### "],
+        'Y' => ["## ##", "## ##", " ### ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  "],
+        _ => ["  ", "  ", "  ", "  ", "  ", "  ", "  ", "  ", "  "], // word gap
+    }
+}
+
+/// Per-pixel-row italic shear, in columns, measured from the bottom. Two pixel
+/// rows that share a character cell differ by ~1 column, so a vertical stroke
+/// renders as `▄█▀` (a smooth half-block gradient) rather than a hard 1-column
+/// jump — that's what de-jags the slant.
+fn logo_shear(pixel_row: usize) -> usize {
+    (LOGO_PX_H - 1 - pixel_row) / 2
+}
+
+/// Draw the "LAME BOY" wordmark at (x, y): half-block rendered with the italic
+/// slant baked into the bitmap (so the diagonals smooth out), in the darkest ink.
+fn draw_logo<W: Write + ?Sized>(stdout: &mut W, x: u16, y: u16) -> io::Result<()> {
+    // Assemble the upright pixel bitmap: one bool row per pixel line, 1-col gap.
+    let mut px: Vec<Vec<bool>> = vec![Vec::new(); LOGO_PX_H];
+    for ch in LOGO_TEXT.chars() {
+        let g = logo_glyph(ch);
+        for (r, row) in px.iter_mut().enumerate() {
+            row.extend(g[r].chars().map(|c| c == '#'));
+            row.push(false); // inter-letter gap
         }
-        
-        stdout.flush()?;
-        thread::sleep(Duration::from_millis(8));
     }
-    
-    // Final frame: everything in solid blue
-    for (line_idx, line) in LOGO_LINES.iter().enumerate() {
-        emit!(
-            stdout,
-            MoveTo(3, (line_idx + 1) as u16),
-            SetForegroundColor(GBC_BLUE),
-            Print(line)
-        )?;
+    // A pixel at source column j on row r lands at output column j + logo_shear(r).
+    let src_w = px.iter().map(|r| r.len()).max().unwrap_or(0);
+    let width = src_w + logo_shear(0);
+    let char_rows = LOGO_PX_H.div_ceil(2);
+
+    // Sample the (possibly out-of-range) pixel for output column `c` on row `r`.
+    let sample = |r: usize, c: usize| -> bool {
+        c.checked_sub(logo_shear(r))
+            .and_then(|j| px[r].get(j))
+            .copied()
+            .unwrap_or(false)
+    };
+
+    emit!(stdout, SetForegroundColor(KEY_COLOR), SetBackgroundColor(SCREEN_BG))?;
+    for cr in 0..char_rows {
+        let top_r = cr * 2;
+        let bot_r = cr * 2 + 1;
+        let mut s = String::new();
+        for c in 0..width {
+            let t = sample(top_r, c);
+            let b = bot_r < LOGO_PX_H && sample(bot_r, c);
+            s.push(match (t, b) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        emit!(stdout, MoveTo(x, y + cr as u16), Print(s.trim_end()))?;
     }
+    emit!(stdout, NORMAL)?;
+    Ok(())
+}
+
+/// Draw a selection caret: blinking when its menu zone is focused, dimmed (not
+/// hidden) when it isn't, so both menus always show where the cursor sits.
+fn draw_caret<W: Write + ?Sized>(stdout: &mut W, active: bool, active_fg: Color) -> io::Result<()> {
+    if active {
+        emit!(stdout, SetAttribute(Attribute::SlowBlink), SetForegroundColor(active_fg), Print("▶"), SetAttribute(Attribute::NoBlink))
+    } else {
+        emit!(stdout, SetForegroundColor(DIM_COLOR), Print("▶"))
+    }
+}
+
+/// Brief splash before the menu (first entry only). Kept tiny so it works on a
+/// short screen and doesn't feel like a separate app.
+fn play_startup_animation<W: Write + ?Sized>(stdout: &mut W) -> io::Result<()> {
+    emit!(stdout, SetBackgroundColor(SCREEN_BG), Clear(ClearType::All))?;
+    draw_logo(stdout, 16, 8)?; // centered-ish splash
     stdout.flush()?;
-    
-    // Brief hold before showing full menu
-    thread::sleep(Duration::from_millis(600));
-    
+    thread::sleep(Duration::from_millis(450));
     Ok(())
 }
 
 impl MenuState {
-    fn new(user: Option<&str>) -> Self {
-        // Load persisted prefs for this user; fall back to cwd if no roms_dir
-        // saved or the saved path no longer exists.
+    fn new(user: Option<&str>, roms_override: Option<&str>) -> Self {
         let saved = config::load(user);
-        let roms_dir = saved
-            .roms_dir
+        // ROM directory precedence (all sysop-controlled): explicit --roms,
+        // then a persisted roms_dir, then the working directory (scan_for_roms
+        // also checks ./roms and ./games).
+        let roms_dir = roms_override
+            .map(PathBuf::from)
             .filter(|p| p.is_dir())
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            });
+            .or_else(|| saved.roms_dir.filter(|p| p.is_dir()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let rom_files = scan_for_roms(&roms_dir);
 
         let mut state = Self {
@@ -324,23 +415,39 @@ impl MenuState {
             },
             sound: saved.sound.as_deref().map(SoundMode::from_code).unwrap_or(SoundMode::Ansi),
             filter: saved.filter.as_deref().map(RomFilter::from_code).unwrap_or(RomFilter::All),
-            roms_dir,
+            screen: saved.screen.as_deref().map(ScreenSize::from_code).unwrap_or(ScreenSize::Auto),
             user: user.map(|u| u.to_string()),
             rom_files,
             filtered: Vec::new(),
             selected_rom_index: 0,
             current_section: MenuSection::RenderMode,
+            last_settings: MenuSection::RenderMode,
             scroll_offset: 0,
+            visible_rows: VISIBLE_ROWS,
             typeahead: String::new(),
         };
         state.rebuild_filter();
         state
     }
 
-    fn refresh_roms(&mut self) {
-        self.rom_files = scan_for_roms(&self.roms_dir);
-        self.typeahead.clear();
+    // Setting toggles, shared by the ◄►/Enter handlers and the R/S/F hotkeys.
+    fn toggle_render(&mut self) {
+        self.render_mode = match self.render_mode {
+            RenderMode::Ascii => RenderMode::Block,
+            RenderMode::Block => RenderMode::Ascii,
+        };
+        self.persist_prefs();
+    }
+
+    fn cycle_sound(&mut self) {
+        self.sound = self.sound.next();
+        self.persist_prefs();
+    }
+
+    fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
         self.rebuild_filter();
+        self.persist_prefs();
     }
 
     /// Recompute the filtered view and reset the cursor to the top.
@@ -371,10 +478,11 @@ impl MenuState {
 
     /// Keep the selected row inside the visible window.
     fn ensure_visible(&mut self) {
+        let win = self.visible_rows.max(1);
         if self.selected_rom_index < self.scroll_offset {
             self.scroll_offset = self.selected_rom_index;
-        } else if self.selected_rom_index >= self.scroll_offset + VISIBLE_ROWS {
-            self.scroll_offset = self.selected_rom_index + 1 - VISIBLE_ROWS;
+        } else if self.selected_rom_index >= self.scroll_offset + win {
+            self.scroll_offset = self.selected_rom_index + 1 - win;
         }
     }
 
@@ -407,6 +515,7 @@ impl MenuState {
                 render_block: Some(self.render_mode == RenderMode::Block),
                 sound: Some(self.sound.code().to_string()),
                 filter: Some(self.filter.code().to_string()),
+                screen: Some(self.screen.code().to_string()),
             },
         );
     }
@@ -463,9 +572,11 @@ pub fn show_menu(
     term: &mut dyn Term,
     input: &mut Input,
     user: Option<&str>,
+    roms_override: Option<&str>,
     animate: bool,
+    screen_orig: &mut Option<(u16, u16)>,
 ) -> io::Result<Option<MenuConfig>> {
-    let mut state = MenuState::new(user);
+    let mut state = MenuState::new(user, roms_override);
 
     // Play the GBC-style startup animation (first entry only). The alternate
     // screen / raw mode are owned by the caller and shared with the game.
@@ -474,30 +585,96 @@ pub fn show_menu(
         play_startup_animation(&mut w)?;
     }
 
-    run_menu_loop(term, input, &mut state)
+    let result = run_menu_loop(term, input, &mut state, screen_orig);
+    // Drop the LCD background before leaving so it doesn't bleed into the game
+    // render or the terminal after the door exits.
+    let _ = emit!(term, ResetColor, Clear(ClearType::All));
+    let _ = term.flush();
+    result
+}
+
+/// Sync the terminal to the chosen `ScreenSize` after it changes. "Best" captures
+/// the current size (into `screen_orig`) and resizes to the ideal; "Auto"
+/// restores the captured size. Idempotent, and persists the preference.
+fn apply_screen(
+    state: &MenuState,
+    term: &mut dyn Term,
+    screen_orig: &mut Option<(u16, u16)>,
+    cur_rows: u16,
+    cur_cols: u16,
+) {
+    match state.screen {
+        ScreenSize::Best => {
+            if screen_orig.is_none() {
+                *screen_orig = Some((cur_rows, cur_cols));
+                let _ = crate::resize_terminal(term, BEST_ROWS, BEST_COLS);
+            }
+        }
+        ScreenSize::Auto => {
+            if let Some((rows, cols)) = screen_orig.take() {
+                let _ = crate::resize_terminal(term, rows, cols);
+            }
+        }
+    }
+    state.persist_prefs();
 }
 
 fn run_menu_loop(
     term: &mut dyn Term,
     input: &mut Input,
     state: &mut MenuState,
+    screen_orig: &mut Option<(u16, u16)>,
 ) -> io::Result<Option<MenuConfig>> {
     // Tracks the last keystroke time so the type-ahead buffer can reset after
     // a pause. Starts far enough in the past that the first keypress is fresh.
     let mut last_key = Instant::now() - TYPEAHEAD_RESET * 2;
 
-    loop {
+    // Track the caller's terminal size so the game list fills the screen. It
+    // starts at the 80x24 fallback and self-corrects from the first probe reply.
+    let mut term_rows: u16 = 24;
+    let mut term_cols: u16 = 80;
+
+    'redraw: loop {
+        state.visible_rows = visible_for(term_rows);
+
         // Draw through a CP437 adapter over the shared terminal, then release the
         // borrow so we can read input from the same terminal.
         {
             let mut stdout = Cp437Writer::new(&mut *term);
             draw_menu(&mut stdout, state)?;
         }
+        // Ask the terminal its size; the reply comes back as a Resize event below
+        // and re-lays-out the list — no keystroke needed.
+        let _ = crate::send_size_probe(&mut *term);
+        let _ = term.flush();
 
-        // Wait for a key (None = the caller hung up).
-        let key = match input.wait(term)? {
-            Some(k) => k,
-            None => return Ok(None),
+        // Wait for a key, applying any size reports in between (redraw only when
+        // the height actually changes, so a stable size doesn't busy-loop).
+        let key = loop {
+            match input.wait_event(term)? {
+                MenuEvent::Key(k) => break k,
+                MenuEvent::Resize(rows, cols) => {
+                    // Persisted "Best" not yet applied: the reported size is the
+                    // pre-resize original — capture it, then resize and re-probe.
+                    if state.screen == ScreenSize::Best && screen_orig.is_none() {
+                        *screen_orig = Some((rows, cols));
+                        let _ = crate::resize_terminal(term, BEST_ROWS, BEST_COLS);
+                        let _ = term.flush();
+                        continue 'redraw;
+                    }
+                    term_cols = cols;
+                    if rows >= 10 && rows != term_rows {
+                        term_rows = rows;
+                        continue 'redraw;
+                    }
+                }
+                // Idle: re-probe so a resize that happened while we sat still is
+                // noticed (its reply arrives as a Resize on the next iteration).
+                MenuEvent::Idle => {
+                    let _ = crate::send_size_probe(&mut *term);
+                    let _ = term.flush();
+                }
+            }
         };
 
         // ── Game-list type-ahead ────────────────────────────────────────────
@@ -561,13 +738,16 @@ fn run_menu_loop(
                     state.current_section = state.current_section.next();
                 }
             }
-            Key::Tab => {
+            // Tab jumps between the Settings zone and the game list, keeping the
+            // game-list selection where it was (so you can pop up, change a
+            // setting, and come right back without scrolling).
+            Key::Tab | Key::BackTab => {
                 state.typeahead.clear();
-                state.current_section = state.current_section.next();
-            }
-            Key::BackTab => {
-                state.typeahead.clear();
-                state.current_section = state.current_section.prev();
+                state.current_section = if state.current_section == MenuSection::GameList {
+                    state.last_settings
+                } else {
+                    MenuSection::GameList
+                };
             }
             // Left/Right and Space (Select): Toggle options
             Key::Left | Key::Right | Key::Char(' ') => {
@@ -596,6 +776,14 @@ fn run_menu_loop(
                         state.rebuild_filter();
                         state.persist_prefs();
                     }
+                    MenuSection::Screen => {
+                        state.screen = if key == Key::Left {
+                            state.screen.prev()
+                        } else {
+                            state.screen.next()
+                        };
+                        apply_screen(state, term, screen_orig, term_rows, term_cols);
+                    }
                     _ => {}
                 }
             }
@@ -611,166 +799,108 @@ fn run_menu_loop(
                             }));
                         }
                     }
-                    MenuSection::RomsDirectory => {
-                        if let Some(chosen) = pick_directory(term, input, &state.roms_dir)? {
-                            state.roms_dir = chosen.clone();
-                            state.refresh_roms();
-                            // Persist the chosen directory alongside current prefs
-                            let _ = config::save(
-                                state.user.as_deref(),
-                                &config::Config {
-                                    roms_dir: Some(chosen),
-                                    render_block: Some(state.render_mode == RenderMode::Block),
-                                    sound: Some(state.sound.code().to_string()),
-                                    filter: Some(state.filter.code().to_string()),
-                                },
-                            );
-                        }
-                    }
-                    MenuSection::RenderMode => {
-                        state.render_mode = match state.render_mode {
-                            RenderMode::Ascii => RenderMode::Block,
-                            RenderMode::Block => RenderMode::Ascii,
-                        };
-                        state.persist_prefs();
-                    }
-                    MenuSection::Audio => {
-                        state.sound = state.sound.next();
-                        state.persist_prefs();
-                    }
-                    MenuSection::Filter => {
-                        state.filter = state.filter.next();
-                        state.rebuild_filter();
-                        state.persist_prefs();
+                    MenuSection::RenderMode => state.toggle_render(),
+                    MenuSection::Audio => state.cycle_sound(),
+                    MenuSection::Filter => state.cycle_filter(),
+                    MenuSection::Screen => {
+                        state.screen = state.screen.next();
+                        apply_screen(state, term, screen_orig, term_rows, term_cols);
                     }
                 }
             }
-            Key::Char('r') | Key::Char('R') => {
-                state.refresh_roms();
-            }
             _ => {}
+        }
+
+        // Remember the focused settings row so Tab can return to it.
+        if state.current_section != MenuSection::GameList {
+            state.last_settings = state.current_section;
         }
     }
 }
 
 fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
-    emit!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-    
-    // Draw top border
-    emit!(stdout, SetForegroundColor(BORDER_COLOR))?;
-    emit!(stdout, MoveTo(2, 0), Print(format!("╔{}╗", "═".repeat(LOGO_WIDTH))))?;
-    
-    // Draw logo in solid blue (matching the GBC startup end state)
-    for (i, line) in LOGO_LINES.iter().enumerate() {
-        emit!(stdout, MoveTo(2, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
-        emit!(stdout, MoveTo(3, (i + 1) as u16), SetForegroundColor(GBC_BLUE), Print(line))?;
-        emit!(stdout, MoveTo((3 + LOGO_WIDTH) as u16, (i + 1) as u16), SetForegroundColor(BORDER_COLOR), Print("║"))?;
-    }
-    
-    // Draw bottom border
-    emit!(stdout, SetForegroundColor(BORDER_COLOR))?;
-    emit!(stdout, MoveTo(2, (LOGO_LINES.len() + 1) as u16), Print(format!("╚{}╝", "═".repeat(LOGO_WIDTH))))?;
-    
-    let menu_start_y = LOGO_LINES.len() as u16 + 3;
-    
-    // Draw settings section
-    emit!(stdout, MoveTo(4, menu_start_y))?;
-    emit!(stdout, SetForegroundColor(ACCENT_COLOR), Print("═══ Settings ═══"), ResetColor)?;
-    
-    // Render Mode
-    draw_option(
-        stdout, 
-        4, 
-        menu_start_y + 2, 
-        "Render Mode", 
-        &format!("◄ {} ►", match state.render_mode {
-            RenderMode::Ascii => "ASCII ",
-            RenderMode::Block => "Block ",
-        }),
-        state.current_section == MenuSection::RenderMode
-    )?;
-    
-    // Sound (Off / ANSI music / APC PCM)
-    draw_option(
-        stdout,
-        4,
-        menu_start_y + 3,
-        "Sound      ",
-        &format!("◄ {} ►", state.sound.label()),
-        state.current_section == MenuSection::Audio
-    )?;
-    
-    // Filter (game type) — All / GB / GBC
-    draw_option(
-        stdout,
-        4,
-        menu_start_y + 4,
-        "Filter     ",
-        &format!("◄ {} ►", state.filter.label()),
-        state.current_section == MenuSection::Filter
-    )?;
+    // Paint the whole screen the Game Boy LCD background, then draw dark ink on it.
+    emit!(stdout, SetBackgroundColor(SCREEN_BG), Clear(ClearType::All))?;
 
-    // ROMs Directory — show full path, indicate if it's the persisted default
-    let saved_roms_dir = config::load(state.user.as_deref()).roms_dir;
-    let is_saved = saved_roms_dir.as_deref() == Some(state.roms_dir.as_path());
-    let dir_display = state.roms_dir.to_string_lossy().to_string();
-    let dir_label = if is_saved {
-        format!("{} [saved]", truncate_str(&dir_display, 32))
-    } else {
-        truncate_str(&dir_display, 40)
-    };
-    draw_option(
-        stdout,
-        4,
-        menu_start_y + 5,
-        "Directory  ",
-        &dir_label,
-        state.current_section == MenuSection::RomsDirectory
-    )?;
-
-    // Games section header: active filter + how many ROMs match
-    emit!(stdout, MoveTo(4, menu_start_y + 7))?;
+    // Hints at the very top so they stay in view on tall terminals.
     emit!(
         stdout,
-        SetForegroundColor(ACCENT_COLOR),
-        Print(format!("═══ Games: {} ({}) ═══", state.filter.label().trim(), state.filtered.len())),
-        ResetColor
+        MoveTo(3, 0),
+        SetForegroundColor(KEY_COLOR), Print("↑↓"), SetForegroundColor(DIM_COLOR), Print(" move   "),
+        SetForegroundColor(KEY_COLOR), Print("Tab"), SetForegroundColor(DIM_COLOR), Print(" settings/list   "),
+        SetForegroundColor(KEY_COLOR), Print("◄►"), SetForegroundColor(DIM_COLOR), Print(" change   "),
+        SetForegroundColor(KEY_COLOR), Print("Z/Enter"), SetForegroundColor(DIM_COLOR), Print(" play   "),
+        SetForegroundColor(KEY_COLOR), Print("Esc"), SetForegroundColor(DIM_COLOR), Print(" quit"),
+        NORMAL
     )?;
-    // Type-ahead indicator (shown while searching in the game list)
+    emit!(
+        stdout,
+        MoveTo(4, 1),
+        SetForegroundColor(KEY_COLOR), Print("type"), SetForegroundColor(DIM_COLOR), Print(" any letters to jump to a game"),
+        NORMAL
+    )?;
+
+    // Wordmark on the left (rows 3-7); Settings menu to its right. The settings
+    // caret tracks last_settings so it stays put (dimmed) while the list is focused.
+    draw_logo(stdout, 2, 3)?;
+
+    let settings_x: u16 = 54;
+    let zone_settings = state.current_section != MenuSection::GameList;
+    emit!(stdout, MoveTo(settings_x, 3), SetForegroundColor(ACCENT_COLOR), Print("══ Settings ══"), NORMAL)?;
+    let render_label = match state.render_mode {
+        RenderMode::Ascii => "ASCII",
+        RenderMode::Block => "Block",
+    };
+    draw_option(stdout, settings_x, 4, "Render", render_label, state.last_settings == MenuSection::RenderMode, zone_settings)?;
+    draw_option(stdout, settings_x, 5, "Sound", state.sound.label().trim(), state.last_settings == MenuSection::Audio, zone_settings)?;
+    draw_option(stdout, settings_x, 6, "Filter", state.filter.label().trim(), state.last_settings == MenuSection::Filter, zone_settings)?;
+    draw_option(stdout, settings_x, 7, "Size", state.screen.label(), state.last_settings == MenuSection::Screen, zone_settings)?;
+
+    // Optional, low-key nudge about terminal size for the sharpest game picture.
+    // Semi-dark ink on a semi-light olive bar so it reads as a tip, not a warning;
+    // "any size still works" keeps it from scaring off smaller terminals. Hidden
+    // when "Best" is selected (the door is already managing the size).
+    if state.screen != ScreenSize::Best {
+        emit!(
+            stdout,
+            MoveTo(2, 8),
+            SetBackgroundColor(LIME),
+            SetForegroundColor(INK_MID),
+            Print(" Optional: set Size to Best (or use a 172x74 terminal) for the sharpest picture "),
+            NORMAL
+        )?;
+    }
+
+    // Games header + type-ahead indicator.
+    emit!(
+        stdout,
+        MoveTo(4, GAMES_HEADER_Y),
+        SetForegroundColor(ACCENT_COLOR),
+        Print(format!("══ Games: {} ({}) ══", state.filter.label().trim(), state.filtered.len())),
+        NORMAL
+    )?;
     if state.current_section == MenuSection::GameList && !state.typeahead.is_empty() {
         emit!(
             stdout,
-            MoveTo(40, menu_start_y + 7),
-            SetForegroundColor(HIGHLIGHT_FG),
-            Print(format!("Find: {}", truncate_str(&state.typeahead, 24))),
-            ResetColor
+            MoveTo(44, GAMES_HEADER_Y),
+            SetForegroundColor(KEY_COLOR),
+            Print("Find: "),
+            SetForegroundColor(TEXT_COLOR),
+            Print(truncate_str(&state.typeahead, 20)),
+            NORMAL
         )?;
     }
 
-    let games_start_y = menu_start_y + 9;
-
+    let games_start_y = GAMES_START_Y;
     if state.filtered.is_empty() {
         let msg = if state.rom_files.is_empty() {
-            "No ROM files found (.gb, .gbc)"
+            "No ROMs found — add .gb/.gbc files beside the binary"
         } else {
-            "No games match this filter — change Filter above"
+            "No games match this filter"
         };
-        emit!(
-            stdout,
-            MoveTo(4, games_start_y),
-            SetForegroundColor(DIM_COLOR),
-            Print(msg),
-            ResetColor
-        )?;
-        emit!(
-            stdout,
-            MoveTo(4, games_start_y + 1),
-            SetForegroundColor(DIM_COLOR),
-            Print("Press [R] to refresh"),
-            ResetColor
-        )?;
+        emit!(stdout, MoveTo(4, games_start_y), SetForegroundColor(DIM_COLOR), Print(msg), NORMAL)?;
     } else {
-        let visible_count = VISIBLE_ROWS.min(state.filtered.len());
+        let visible_count = state.visible_rows.min(state.filtered.len());
         let is_game_list_selected = state.current_section == MenuSection::GameList;
 
         for (i, &rom_idx) in state.filtered.iter()
@@ -782,123 +912,108 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
             let actual_index = state.scroll_offset + i;
             let is_selected = actual_index == state.selected_rom_index;
 
-            // Title without the extension; the type tag conveys GB vs GBC.
             let title = rom.file_stem()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
             let is_gbc = rom.extension()
                 .map(|e| e.to_string_lossy().eq_ignore_ascii_case("gbc"))
                 .unwrap_or(false);
-            let tag = if is_gbc { "GBC" } else { "GB" };
-            let tag_color = if is_gbc { ACCENT_COLOR } else { TEXT_COLOR };
 
             draw_rom_row(
                 stdout,
                 games_start_y + i as u16,
                 &title,
-                tag,
-                tag_color,
+                is_gbc,
                 is_selected,
-                is_selected && is_game_list_selected,
+                is_game_list_selected,
             )?;
         }
 
         // Scroll indicators
         let arrow_x: u16 = 65;
         if state.scroll_offset > 0 {
-            emit!(
-                stdout,
-                MoveTo(arrow_x, games_start_y),
-                SetForegroundColor(ACCENT_COLOR),
-                Print("▲"),
-                ResetColor
-            )?;
+            emit!(stdout, MoveTo(arrow_x, games_start_y), SetForegroundColor(KEY_COLOR), Print("▲"), NORMAL)?;
         }
         if state.scroll_offset + visible_count < state.filtered.len() {
-            emit!(
-                stdout,
-                MoveTo(arrow_x, games_start_y + visible_count as u16 - 1),
-                SetForegroundColor(ACCENT_COLOR),
-                Print("▼"),
-                ResetColor
-            )?;
+            emit!(stdout, MoveTo(arrow_x, games_start_y + visible_count as u16 - 1), SetForegroundColor(KEY_COLOR), Print("▼"), NORMAL)?;
         }
     }
-
-    // Help text
-    let help_y = games_start_y + VISIBLE_ROWS as u16 + 2;
-    emit!(stdout, MoveTo(4, help_y), SetForegroundColor(DIM_COLOR))?;
-    emit!(stdout, Print("↑↓ Move   Type to jump   Z/Enter Play   ◄► Change setting   Esc Quit"))?;
-    emit!(stdout, MoveTo(4, help_y + 1), SetForegroundColor(DIM_COLOR))?;
-    emit!(stdout, Print("Filter: All / GB / GBC    Directory: Enter to browse, S to save    R Refresh"))?;
-    emit!(stdout, ResetColor)?;
 
     stdout.flush()?;
     Ok(())
 }
 
-/// Draw a single ROM row: " ▶ <title>   <TAG> ", with the type tag in its own
-/// color so Game Boy (GB) vs Game Boy Color (GBC) is visible at a glance.
+/// Draw a single ROM row: " ▶ <title>   <TAG> ". The GB/GBC tag color flips with
+/// the row's background so it stays legible on both the light list and the dark
+/// selection bar. `selected`: this row is the game-list cursor. `zone_active`:
+/// the game list is the focused zone — draws the dark selection bar and blinks
+/// the caret; when inactive the caret is dimmed but the row stays marked.
 fn draw_rom_row(
     stdout: &mut impl Write,
     y: u16,
     title: &str,
-    tag: &str,
-    tag_color: Color,
-    marker: bool,
-    highlight: bool,
+    is_gbc: bool,
+    selected: bool,
+    zone_active: bool,
 ) -> io::Result<()> {
-    let prefix = if marker { " ▶ " } else { "   " };
-    let name = format!("{}{:<width$} ", prefix, truncate_str(title, NAME_WIDTH), width = NAME_WIDTH);
+    let tag = if is_gbc { "GBC" } else { "GB" };
+    let name = format!("{:<width$} ", truncate_str(title, NAME_WIDTH), width = NAME_WIDTH);
+    let bar = selected && zone_active;
     emit!(stdout, MoveTo(4, y))?;
-    if highlight {
-        emit!(
-            stdout,
-            SetBackgroundColor(HIGHLIGHT_BG),
-            SetForegroundColor(HIGHLIGHT_FG),
-            Print(name),
-            SetForegroundColor(tag_color),
-            Print(format!("{:<3} ", tag)),
-            ResetColor
-        )?;
-    } else {
-        let name_color = if marker { TEXT_COLOR } else { DIM_COLOR };
-        emit!(
-            stdout,
-            SetForegroundColor(name_color),
-            Print(name),
-            SetForegroundColor(tag_color),
-            Print(format!("{:<3} ", tag)),
-            ResetColor
-        )?;
+    if bar {
+        emit!(stdout, SetBackgroundColor(HIGHLIGHT_BG))?;
     }
+    // Caret cell (" ▶ " or "   "), on the bar background when active.
+    if selected {
+        emit!(stdout, Print(" "))?;
+        draw_caret(stdout, zone_active, HIGHLIGHT_FG)?;
+        emit!(stdout, Print(" "))?;
+    } else {
+        emit!(stdout, Print("   "))?;
+    }
+    // Name + tag.
+    let (name_color, tag_color) = if bar {
+        (HIGHLIGHT_FG, if is_gbc { LIME } else { SCREEN_BG })
+    } else if selected {
+        (KEY_COLOR, if is_gbc { INK } else { INK_MID })
+    } else {
+        (TEXT_COLOR, if is_gbc { INK } else { INK_MID })
+    };
+    emit!(
+        stdout,
+        SetForegroundColor(name_color),
+        Print(name),
+        SetForegroundColor(tag_color),
+        Print(format!("{:<3} ", tag)),
+        NORMAL
+    )?;
     Ok(())
 }
 
-fn draw_option(stdout: &mut impl Write, x: u16, y: u16, label: &str, value: &str, selected: bool) -> io::Result<()> {
+/// `caret`: this row holds the settings cursor. `zone_active`: the settings menu
+/// (not the game list) is the focused zone — drives blink vs dim on the caret.
+fn draw_option(stdout: &mut impl Write, x: u16, y: u16, label: &str, value: &str, caret: bool, zone_active: bool) -> io::Result<()> {
+    let label_color = if caret && zone_active { KEY_COLOR } else { TEXT_COLOR };
+    let value_color = if caret { KEY_COLOR } else { DIM_COLOR };
+    let arrow_color = if caret { KEY_COLOR } else { DIM_COLOR };
     emit!(stdout, MoveTo(x, y))?;
-    
-    if selected {
-        emit!(
-            stdout,
-            SetBackgroundColor(HIGHLIGHT_BG),
-            SetForegroundColor(HIGHLIGHT_FG),
-            Print(format!(" {} ", label)),
-            SetForegroundColor(ACCENT_COLOR),
-            Print(format!("{} ", value)),
-            ResetColor
-        )?;
+    if caret {
+        draw_caret(stdout, zone_active, KEY_COLOR)?;
     } else {
-        emit!(
-            stdout,
-            SetForegroundColor(TEXT_COLOR),
-            Print(format!(" {} ", label)),
-            SetForegroundColor(DIM_COLOR),
-            Print(format!("{} ", value)),
-            ResetColor
-        )?;
+        emit!(stdout, Print(" "))?;
     }
-    
+    emit!(
+        stdout,
+        SetForegroundColor(label_color),
+        Print(format!(" {:<7}", label)),
+        SetForegroundColor(arrow_color),
+        Print("◄ "),
+        SetForegroundColor(value_color),
+        Print(format!("{:<5}", value)),
+        SetForegroundColor(arrow_color),
+        Print(" ►"),
+        NORMAL
+    )?;
     Ok(())
 }
 
@@ -910,348 +1025,6 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_len.saturating_sub(1)).collect();
         format!("{}…", truncated)
-    }
-}
-
-/// Count .gb/.gbc files directly inside a directory (non-recursive).
-fn count_roms_in(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|x| {
-                            let x = x.to_string_lossy().to_lowercase();
-                            x == "gb" || x == "gbc"
-                        })
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0)
-}
-
-/// Read the immediate subdirectories of `dir`, sorted case-insensitively.
-fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let p = e.path();
-                    // Skip hidden directories (start with '.')
-                    let name = p.file_name()?.to_string_lossy().to_string();
-                    if name.starts_with('.') {
-                        return None;
-                    }
-                    if p.is_dir() { Some(p) } else { None }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    dirs.sort_by(|a, b| {
-        a.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase()
-            .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
-    });
-    dirs
-}
-
-/// Interactive directory browser. Returns the chosen PathBuf if the user
-/// pressed S (Set & Save), or None if they cancelled.
-///
-/// Runs inside the already-active alternate screen / raw mode.
-fn pick_directory(
-    term: &mut dyn Term,
-    input: &mut Input,
-    start_dir: &Path,
-) -> io::Result<Option<PathBuf>> {
-    let mut current = start_dir.to_path_buf();
-    let mut subdirs = list_subdirs(&current);
-    // Index 0 = ".." (go up), indices 1.. = subdirs
-    let mut selected: usize = 0;
-    let mut scroll: usize = 0;
-    let max_visible: usize = 16;
-
-    // Input mode state
-    let mut typing_path = false;
-    let mut typed_input = String::new();
-    let mut status_msg: Option<(String, bool)> = None; // (msg, is_error)
-
-    loop {
-        // ── Draw the browser ──────────────────────────────────────────────
-        {
-        let mut stdout = Cp437Writer::new(&mut *term);
-        emit!(stdout, Clear(ClearType::All))?;
-
-        // Title bar
-        emit!(
-            stdout,
-            MoveTo(2, 0),
-            SetForegroundColor(ACCENT_COLOR),
-            Print("╔══ Browse ROM Directory ══╗"),
-            ResetColor
-        )?;
-
-        // Current path
-        emit!(
-            stdout,
-            MoveTo(2, 1),
-            SetForegroundColor(TEXT_COLOR),
-            Print("Path: "),
-            SetForegroundColor(HIGHLIGHT_FG),
-            Print(truncate_str(&current.to_string_lossy(), 60)),
-            ResetColor
-        )?;
-
-        // ROM count in current dir
-        let rom_count = count_roms_in(&current);
-        let rom_hint = if rom_count == 0 {
-            format!("  ({} ROMs here)", rom_count)
-        } else {
-            format!("  ({} ROM{} here ✓)", rom_count, if rom_count == 1 { "" } else { "s" })
-        };
-        emit!(
-            stdout,
-            MoveTo(2, 2),
-            SetForegroundColor(if rom_count > 0 { ACCENT_COLOR } else { DIM_COLOR }),
-            Print(&rom_hint),
-            ResetColor
-        )?;
-
-        emit!(
-            stdout,
-            MoveTo(2, 3),
-            SetForegroundColor(BORDER_COLOR),
-            Print("─".repeat(60)),
-            ResetColor
-        )?;
-
-        // Build entry list: ".." first, then subdirs
-        let total_entries = 1 + subdirs.len(); // 0 = "..", 1.. = subdirs
-        let list_start_y: u16 = 4;
-
-        // Clamp scroll so selected is always visible
-        if selected < scroll {
-            scroll = selected;
-        } else if selected >= scroll + max_visible {
-            scroll = selected.saturating_sub(max_visible - 1);
-        }
-
-        for i in 0..max_visible {
-            let entry_idx = scroll + i;
-            if entry_idx >= total_entries {
-                break;
-            }
-            let y = list_start_y + i as u16;
-            let is_selected = entry_idx == selected;
-
-            if entry_idx == 0 {
-                // ".." entry
-                emit!(stdout, MoveTo(2, y))?;
-                if is_selected {
-                    emit!(
-                        stdout,
-                        SetBackgroundColor(HIGHLIGHT_BG),
-                        SetForegroundColor(HIGHLIGHT_FG),
-                        Print(format!(" ▶ ../  (go up) {:>35} ", "")),
-                        ResetColor
-                    )?;
-                } else {
-                    emit!(
-                        stdout,
-                        SetForegroundColor(DIM_COLOR),
-                        Print("   ../  (go up)"),
-                        ResetColor
-                    )?;
-                }
-            } else {
-                let sub = &subdirs[entry_idx - 1];
-                let name = sub
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let roms_here = count_roms_in(sub);
-                let suffix = if roms_here > 0 {
-                    format!("  [{} ROM{}]", roms_here, if roms_here == 1 { "" } else { "s" })
-                } else {
-                    String::new()
-                };
-
-                emit!(stdout, MoveTo(2, y))?;
-                if is_selected {
-                    emit!(
-                        stdout,
-                        SetBackgroundColor(HIGHLIGHT_BG),
-                        SetForegroundColor(HIGHLIGHT_FG),
-                        Print(format!(" ▶ {:<44}{}", truncate_str(&name, 44), truncate_str(&suffix, 14))),
-                        ResetColor
-                    )?;
-                } else {
-                    emit!(
-                        stdout,
-                        SetForegroundColor(TEXT_COLOR),
-                        Print(format!("   {:<44}", truncate_str(&name, 44))),
-                        SetForegroundColor(ACCENT_COLOR),
-                        Print(truncate_str(&suffix, 14)),
-                        ResetColor
-                    )?;
-                }
-            }
-        }
-
-        // Scroll indicators
-        let vis_end_y = list_start_y + max_visible.min(total_entries) as u16;
-        if scroll > 0 {
-            emit!(stdout, MoveTo(64, list_start_y), SetForegroundColor(ACCENT_COLOR), Print("▲"), ResetColor)?;
-        }
-        if scroll + max_visible < total_entries {
-            emit!(stdout, MoveTo(64, vis_end_y - 1), SetForegroundColor(ACCENT_COLOR), Print("▼"), ResetColor)?;
-        }
-
-        // Separator
-        let sep_y = list_start_y + max_visible as u16 + 1;
-        emit!(
-            stdout,
-            MoveTo(2, sep_y),
-            SetForegroundColor(BORDER_COLOR),
-            Print("─".repeat(60)),
-            ResetColor
-        )?;
-
-        // Status / path-input line
-        let status_y = sep_y + 1;
-        if typing_path {
-            emit!(
-                stdout,
-                MoveTo(2, status_y),
-                SetForegroundColor(ACCENT_COLOR),
-                Print("Path: "),
-                SetForegroundColor(TEXT_COLOR),
-                Print(&typed_input),
-                Print("█"),  // cursor
-                ResetColor
-            )?;
-        } else if let Some((ref msg, is_err)) = status_msg {
-            emit!(
-                stdout,
-                MoveTo(2, status_y),
-                SetForegroundColor(if is_err {
-                    Color::Rgb { r: 255, g: 80, b: 80 }
-                } else {
-                    ACCENT_COLOR
-                }),
-                Print(msg),
-                ResetColor
-            )?;
-        }
-
-        // Help footer
-        let help_y = status_y + 2;
-        emit!(
-            stdout,
-            MoveTo(2, help_y),
-            SetForegroundColor(DIM_COLOR),
-            Print("↑↓ Move  Enter Navigate  S Set&Save  P Type path  Esc/X Cancel"),
-            ResetColor
-        )?;
-
-        stdout.flush()?;
-        } // end draw scope — release the terminal borrow so we can read input
-
-        // ── Handle input ──────────────────────────────────────────────────
-        {
-            let key = match input.wait(term)? {
-                Some(k) => k,
-                None => return Ok(None),
-            };
-            status_msg = None; // clear status on next keypress
-
-            if typing_path {
-                match key {
-                    Key::Esc => {
-                        typing_path = false;
-                        typed_input.clear();
-                    }
-                    Key::Enter => {
-                        // Confirm the typed path
-                        let expanded = if typed_input.is_empty() {
-                            None
-                        } else {
-                            config::expand_tilde(typed_input.trim())
-                        };
-                        if let Some(p) = expanded {
-                            if p.is_dir() {
-                                current = p;
-                                subdirs = list_subdirs(&current);
-                                selected = 0;
-                                scroll = 0;
-                                typing_path = false;
-                                typed_input.clear();
-                                status_msg = Some(("Directory set.".to_string(), false));
-                            } else {
-                                status_msg = Some(("Path not found or not a directory.".to_string(), true));
-                            }
-                        } else {
-                            status_msg = Some(("Invalid path.".to_string(), true));
-                        }
-                        if !typing_path { typed_input.clear(); }
-                    }
-                    Key::Backspace => {
-                        typed_input.pop();
-                    }
-                    Key::Char(c) => {
-                        typed_input.push(c);
-                    }
-                    _ => {}
-                }
-            } else {
-                match key {
-                    Key::Esc | Key::Char('x') | Key::Char('X') => {
-                        return Ok(None);
-                    }
-                    Key::Up => {
-                        if selected > 0 { selected -= 1; }
-                    }
-                    Key::Down => {
-                        if selected + 1 < 1 + subdirs.len() { selected += 1; }
-                    }
-                    Key::Enter | Key::Char('z') | Key::Char('Z') => {
-                        if selected == 0 {
-                            // Go up
-                            if let Some(parent) = current.parent().map(|p| p.to_path_buf()) {
-                                current = parent;
-                                subdirs = list_subdirs(&current);
-                                selected = 0;
-                                scroll = 0;
-                            }
-                        } else {
-                            // Enter subdirectory
-                            let target = subdirs[selected - 1].clone();
-                            current = target;
-                            subdirs = list_subdirs(&current);
-                            selected = 0;
-                            scroll = 0;
-                        }
-                    }
-                    Key::Char('s') | Key::Char('S') => {
-                        // Set & Save current directory
-                        return Ok(Some(current));
-                    }
-                    Key::Char('p') | Key::Char('P') => {
-                        // Switch to manual path entry mode
-                        typing_path = true;
-                        typed_input.clear();
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 }
 
@@ -1272,5 +1045,27 @@ mod tests {
         for f in [RomFilter::All, RomFilter::GameBoy, RomFilter::GameBoyColor] {
             assert!(RomFilter::from_code(f.code()) == f);
         }
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn menu_paints_the_gameboy_lcd_palette() {
+        // Render the menu to a buffer (no terminal needed) and check the Game Boy
+        // colors actually go out: the LCD background fill and the dark ink.
+        let state = MenuState::new(None, None);
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Cp437Writer::new(&mut buf);
+            draw_menu(&mut w, &state).unwrap();
+        }
+        assert!(contains(&buf, b"\x1b[48;2;202;220;159m"), "LCD background not emitted");
+        assert!(contains(&buf, b"\x1b[38;2;48;98;48m"), "ink text not emitted");
+        // The block wordmark renders as CP437 full-block bytes (0xDB).
+        assert!(buf.contains(&0xDB), "block wordmark not emitted");
+        // The old blue/yellow scheme must be gone.
+        assert!(!contains(&buf, b"\x1b[38;2;255;210;70m"), "stale yellow accent still present");
     }
 }

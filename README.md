@@ -41,8 +41,10 @@ over a remote link. Full detail (with file/symbol pointers) is in
   launched with no ROM and shows its browser), it reads the caller's identity from
   the dropfile, and drops back to the menu on quit instead of exiting.
 - **ROM browser rebuilt for large libraries** — type-ahead jump, a Game Boy /
-  Game Boy Color / All filter, wider names with a GB/GBC type tag, and a
-  directory picker.
+  Game Boy Color / All filter, and wider names with a GB/GBC type tag. The
+  compact menu fits an 80x24 screen. The ROM directory is a sysop setting
+  (`--roms` / config), not a caller-facing browser — no letting callers wander
+  the server's filesystem.
 - **Per-user state** — render mode, sound, and filter preferences persist per BBS
   user, and battery saves are isolated under `.saves/<user>/`.
 - **Link backpressure pacing** — the transmit frame rate is capped (default
@@ -63,46 +65,62 @@ other runtime libs required.
    programs (e.g. `xtrn/gb/`), so you have `…/gb/terminal_gameboy`.
 2. Drop your own legally-obtained `.gb` / `.gbc` ROMs into a `roms/` folder beside
    the binary.
-3. Add the door in your BBS's door/external-program config with one of the
-   command lines below; see [`xtrn.ini.example`](xtrn.ini.example) for ready-to-paste
-   stanzas. Recycle/restart the BBS.
+3. Add the door in your BBS's door/external-program config (SCFG on Synchronet,
+   the door manager on EleBBS/Mystic/…) with the matching command line below,
+   then recycle/restart the BBS.
 
 Verify a download against `SHA256SUMS.txt` from the release.
 
 ## Running as a door
 
-How the door reaches the caller depends on your BBS:
+The command line stays short — the only argument that matters is how the caller
+is connected. Everything else has sane defaults (and a `lameboy.ini`, below):
 
 - **stdio BBSes** (Synchronet and others that connect a door over stdin/stdout):
   ```
-  ./terminal_gameboy --mute --ansi-music --user %4
+  ./terminal_gameboy --user %4
   ```
   `%4` is Synchronet's specifier for the zero-padded user number (use your BBS's
-  equivalent), which keys per-user saves and preferences.
+  equivalent); it keys per-user saves and preferences.
 
 - **DOOR32.SYS BBSes** (EleBBS, Mystic, Windows BBSes, …) hand the door an
-  inherited socket via a dropfile — pass its path with `--dropfile`. The user
-  identity is read from the dropfile, so no `--user` is needed:
+  inherited socket via a dropfile — pass its path, and the user identity comes
+  from the dropfile (no `--user` needed):
   ```
-  terminal_gameboy.exe --mute --ansi-music --dropfile <path-to-DOOR32.SYS>
+  terminal_gameboy.exe --dropfile <path-to-DOOR32.SYS>
   ```
 
-ROMs live in `roms/` next to the binary (gitignored — provide your own). The
-**sound mode (Off / ANSI / APC)** is chosen by the caller in the menu and persists
-per user; `--ansi-music` enables the ANSI option, APC streams full PCM to terminals
-that support SyncTERM audio APCs.
+The **sound mode (Off / ANSI / APC)** is chosen by the caller in the menu and
+persists per user (APC streams full PCM to terminals that support SyncTERM audio
+APCs). The released build never opens a local sound device, so `--mute` is
+unnecessary (it's still accepted).
 
-### Door options
+### lameboy.ini (sysop defaults)
+
+Optional file beside the binary, so you don't repeat settings on the command
+line. Copy [`lameboy.ini.example`](lameboy.ini.example) to `lameboy.ini` and edit.
+Command-line flags override it:
+
+```ini
+roms = roms        ; ROM directory (default: roms/ beside the binary)
+fps  = 20          ; transmit frame-rate cap, 5-60
+ansi_music = true  ; offer ANSI-music sound (false = silent/APC only)
+```
+
+### Command-line flags
+
+All optional; each overrides `lameboy.ini`. Only `--dropfile`/`--user` (the
+per-call connection) are normally passed by the BBS.
 
 | Flag                | Description                                                   |
 | ------------------- | ------------------------------------------------------------- |
 | `--dropfile <path>` | DOOR32.SYS dropfile: use its inherited socket + user identity |
 | `--user <id>`       | Per-user key for saves + preferences (e.g. Synchronet `%4`)   |
-| `--mute`            | Never open a local sound device (required on a headless host) |
-| `--ansi-music`      | Allow ANSI-music sound (caller still picks Off/ANSI/APC)      |
+| `--roms <path>`     | ROM directory (default: `roms/` beside the binary)            |
 | `--fps <n>`         | Transmit frame-rate cap, 5–60 (default 20)                    |
-| `--block`           | Force Unicode half-block rendering                            |
-| `--ascii`           | Force ASCII-art rendering                                     |
+| `--ansi-music`      | Force ANSI-music sound on (default on; disable via the ini)   |
+| `--mute`            | Never open a local sound device (`localaudio` builds only)    |
+| `--block` / `--ascii` | Force a render mode (otherwise the caller's saved choice)   |
 
 ## Building
 
@@ -129,11 +147,11 @@ Releases are built by [CI](.github/workflows/release.yml) on a `v*` tag.
 
 | Key            | Action                                  |
 | -------------- | --------------------------------------- |
-| ↑ / ↓          | Move                                    |
+| ↑ / ↓          | Move within the focused zone (settings rows / game list) |
+| Tab            | Switch between Settings and the game list (keeps your place) |
 | Type letters   | Jump to a game (type-ahead) in the list |
-| ◄ / ► / Space  | Change a setting (render / sound / filter) |
+| ◄ / ► / Space  | Change the focused setting              |
 | Z / Enter      | Play the selected game / confirm        |
-| R              | Rescan the ROM directory                |
 | Esc / Q        | Quit the door                           |
 
 ### In-game

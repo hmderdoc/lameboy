@@ -8,6 +8,9 @@
 # Deployed binary (build artifact produced by `cargo build --release`)
 /terminal_gameboy
 
+# Sysop's live door config (ships only as lameboy.ini.example)
+/lameboy.ini
+
 # ANSI capture dumps (local debugging scratch, not part of the source)
 /menu.bin
 /music_cap.bin

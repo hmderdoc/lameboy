@@ -155,24 +155,38 @@ fn print_usage(program: &str) {
 /// We probe rather than trust an ioctl/winsize because a door's pty size is
 /// frozen at launch (and an inherited socket has no winsize at all), so this
 /// round-trip is the only way to track the caller's real terminal size.
-fn send_size_probe<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+pub(crate) fn send_size_probe<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
     emit!(term, MoveTo(9998, 9998))?;
     term.write_all(b"\x1b[6n")?;
     term.flush()
 }
 
-/// Extract the `--dropfile <path>` / `--dropfile=<path>` value (a DOOR32.SYS).
-fn parse_dropfile(args: &[String]) -> Option<String> {
+/// Ask the terminal to resize its text area to `rows`x`cols` (xterm
+/// `CSI 8 ; rows ; cols t`). xterm-family terminals honor it; SyncTERM/CTerm
+/// ignore it harmlessly (their `CSI ... t` is 24-bit colour and needs 4 params).
+pub(crate) fn resize_terminal<W: Write + ?Sized>(term: &mut W, rows: u16, cols: u16) -> io::Result<()> {
+    write!(term, "\x1b[8;{};{}t", rows, cols)?;
+    term.flush()
+}
+
+/// Extract a `--flag <value>` / `--flag=<value>` argument value, if present.
+fn parse_value(args: &[String], flag: &str) -> Option<String> {
+    let eq = format!("{}=", flag);
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if let Some(v) = a.strip_prefix("--dropfile=") {
+        if let Some(v) = a.strip_prefix(eq.as_str()) {
             return Some(v.to_string()).filter(|s| !s.is_empty());
         }
-        if a == "--dropfile" {
+        if a == flag {
             return it.next().cloned().filter(|s| !s.is_empty());
         }
     }
     None
+}
+
+/// Extract the `--dropfile <path>` value (a DOOR32.SYS).
+fn parse_dropfile(args: &[String]) -> Option<String> {
+    parse_value(args, "--dropfile")
 }
 
 /// Extract the `--user <id>` / `--user=<id>` value, if present. This is the
@@ -218,11 +232,18 @@ fn main() -> io::Result<()> {
         print_usage(&args[0]);
         std::process::exit(0);
     }
+    // Sysop defaults from lameboy.ini (next to the binary). Command-line flags
+    // override these, so the usual door command line stays short.
+    let ini = config::load_door_ini();
+
+    // The released door build has no local audio device, so --mute is effectively
+    // always on; it's still honored for `localaudio` builds and back-compat.
     let force_mute = args.iter().any(|a| a == "--mute");
-    // ANSI-music engine: only available when explicitly enabled (the BBS door
-    // passes --ansi-music). It does NOT open an audio device, so it is independent
-    // of --mute. The menu's Audio toggle gates whether it actually plays.
-    let ansi_music_flag = args.iter().any(|a| a == "--ansi-music");
+    // ANSI music is offered by default (the caller still chooses Off/ANSI/APC in
+    // the menu); a sysop can disable it with `ansi_music = false` in lameboy.ini,
+    // and `--ansi-music` forces it on.
+    let ansi_music_flag =
+        args.iter().any(|a| a == "--ansi-music") || ini.ansi_music.unwrap_or(true);
     let cli_mode = if args.iter().any(|a| a == "--block") {
         Some(RenderMode::Block)
     } else if args.iter().any(|a| a == "--ascii") {
@@ -230,7 +251,7 @@ fn main() -> io::Result<()> {
     } else {
         None
     };
-    let render_fps = parse_fps(&args).unwrap_or(DEFAULT_RENDER_FPS);
+    let render_fps = parse_fps(&args).or(ini.fps).unwrap_or(DEFAULT_RENDER_FPS);
 
     // DOOR32.SYS dropfile: on a BBS that doesn't pass the connection via stdio
     // (e.g. EleBBS/Mystic/Synchronet Win32), it names the inherited socket and
@@ -241,6 +262,9 @@ fn main() -> io::Result<()> {
         .map(Path::new)
         .and_then(door32::read);
     let user_id = parse_user(&args).or_else(|| door.as_ref().and_then(|d| d.user_key()));
+    // ROM directory is a sysop setting: --roms <path>, else lameboy.ini, else
+    // the persisted/default location.
+    let roms_override = parse_value(&args, "--roms").or(ini.roms);
 
     // First non-flag argument (if any) is the ROM path. Skip the value that
     // follows a value-taking flag so it isn't mistaken for a ROM path.
@@ -252,7 +276,7 @@ fn main() -> io::Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--user" || a == "--fps" || a == "--dropfile" {
+            if a == "--user" || a == "--fps" || a == "--dropfile" || a == "--roms" {
                 skip_next = true;
                 continue;
             }
@@ -280,6 +304,7 @@ fn main() -> io::Result<()> {
         force_mute,
         ansi_music_flag,
         user_id.as_deref(),
+        roms_override.as_deref(),
         render_fps,
     );
 
@@ -300,6 +325,7 @@ fn run_session(
     force_mute: bool,
     ansi_music_flag: bool,
     user_id: Option<&str>,
+    roms_override: Option<&str>,
     render_fps: f64,
 ) -> io::Result<()> {
     if let Some(rom) = positional_rom {
@@ -311,8 +337,12 @@ fn run_session(
     }
 
     let mut animate = true;
+    // Set by the menu's "Best" screen-size mode: the caller's original terminal
+    // size, captured before we resized, so we can restore it when the door exits.
+    // Persists across the menu↔game cycle so a game keeps the bigger screen.
+    let mut screen_orig: Option<(u16, u16)> = None;
     loop {
-        match show_menu(term, input, user_id, animate)? {
+        match show_menu(term, input, user_id, roms_override, animate, &mut screen_orig)? {
             Some(config) => {
                 let mode = cli_mode.unwrap_or(config.render_mode);
                 let want_apc = config.sound == SoundMode::Apc;
@@ -328,9 +358,14 @@ fn run_session(
                 )?;
                 animate = false;
             }
-            None => return Ok(()),
+            None => break,
         }
     }
+    // Restore the caller's original terminal size if "Best" resized it.
+    if let Some((rows, cols)) = screen_orig {
+        let _ = resize_terminal(&mut *term, rows, cols);
+    }
+    Ok(())
 }
 
 /// Run a single ROM to completion. Returns when the player quits the game
