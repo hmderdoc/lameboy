@@ -169,7 +169,7 @@ pub enum ScreenSize {
 }
 
 /// Ideal render size in character cells (≈1 char-row per 2 Game Boy pixels).
-pub const BEST_COLS: u16 = 172;
+pub const BEST_COLS: u16 = 162;
 pub const BEST_ROWS: u16 = 74;
 
 impl ScreenSize {
@@ -866,7 +866,7 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
             MoveTo(2, 8),
             SetBackgroundColor(LIME),
             SetForegroundColor(INK_MID),
-            Print(" Optional: set Size to Best (or use a 172x74 terminal) for the sharpest picture "),
+            Print(" Optional: set Size to Best (or use a 162x74 terminal) for the sharpest picture "),
             NORMAL
         )?;
     }
