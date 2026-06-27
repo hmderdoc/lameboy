@@ -47,15 +47,34 @@ impl Door32 {
         }
     }
 
-    /// A stable per-user key for saves/prefs, mirroring Synchronet's `%4`
-    /// (zero-padded user number). Empty if the dropfile had no user number.
+    /// A stable per-user key for saves/prefs. Prefer the numeric user record
+    /// (zero-padded, like Synchronet's `%4`); when the BBS has no usable record
+    /// number — some identify users by name — fall back to the handle, then the
+    /// real name, sanitized to a filesystem-safe key. This keeps every caller's
+    /// saves/prefs separate instead of collapsing name-based users into one
+    /// shared pile. `None` only if the dropfile carries no identity at all.
     pub fn user_key(&self) -> Option<String> {
         if self.user_number > 0 {
-            Some(format!("{:04}", self.user_number))
-        } else {
-            None
+            return Some(format!("{:04}", self.user_number));
         }
+        for name in [self.alias.as_str(), self.real_name.as_str()] {
+            let key = sanitize_key(name);
+            if !key.is_empty() {
+                return Some(key);
+            }
+        }
+        None
     }
+}
+
+/// Fold a name into a filesystem-safe key: keep ASCII alphanumerics, turn
+/// everything else into `_`, and trim leading/trailing `_`.
+fn sanitize_key(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 /// Parse a DOOR32.SYS file. Returns None if it can't be read or the first two
@@ -108,6 +127,19 @@ mod tests {
         assert_eq!(d.alias, "Shurato");
         assert_eq!(d.node, 3);
         assert_eq!(d.user_key().as_deref(), Some("0007"));
+    }
+
+    #[test]
+    fn name_user_keys_off_the_handle_when_no_number() {
+        // user number 0 (BBS identifies by name), handle "Shurato" -> own saves.
+        let d = parse("2\n5\n0\nEleBBS\n0\nReal Name\nShurato\n10\n90\n1\n1\n").unwrap();
+        assert_eq!(d.user_key().as_deref(), Some("Shurato"));
+        // handle with spaces/symbols sanitizes to a safe key
+        let d2 = parse("2\n5\n0\nEleBBS\n0\nReal Name\nSysop Bob!\n10\n90\n1\n1\n").unwrap();
+        assert_eq!(d2.user_key().as_deref(), Some("Sysop_Bob"));
+        // a real number still wins over the name
+        let d3 = parse("2\n5\n0\nEleBBS\n7\nReal Name\nShurato\n10\n90\n1\n1\n").unwrap();
+        assert_eq!(d3.user_key().as_deref(), Some("0007"));
     }
 
     #[test]
