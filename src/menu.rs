@@ -648,8 +648,9 @@ fn run_menu_loop(
             draw_menu(&mut stdout, state)?;
         }
         // Ask the terminal its size; the reply comes back as a Resize event below
-        // and re-lays-out the list — no keystroke needed.
-        let _ = crate::send_size_probe(&mut *term);
+        // and re-lays-out the list — no keystroke needed. Capability probes ride
+        // along (folded in) until keyboard detection resolves.
+        let _ = crate::send_size_probe(&mut *term, !input.caps_resolved());
         let _ = term.flush();
 
         // Wait for a key, applying any size reports in between (redraw only when
@@ -675,7 +676,7 @@ fn run_menu_loop(
                 // Idle: re-probe so a resize that happened while we sat still is
                 // noticed (its reply arrives as a Resize on the next iteration).
                 MenuEvent::Idle => {
-                    let _ = crate::send_size_probe(&mut *term);
+                    let _ = crate::send_size_probe(&mut *term, !input.caps_resolved());
                     let _ = term.flush();
                 }
             }

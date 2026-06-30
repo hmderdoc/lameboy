@@ -31,8 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "localaudio")]
 use audio::{AudioBuffer, GameboyAudioSource};
 use framebuffer::{FrameBuffer, GB_HEIGHT, GB_WIDTH};
-use input::map_key_to_button;
-use keys::{Input, Key};
+use input::{evdev_to_button, map_key_to_button, EVDEV_ESC, EVDEV_Q};
+use keys::{Input, Key, KeyboardMode};
 use menu::{show_menu, SoundMode};
 use renderer::{RenderConfig, RenderMode, Renderer};
 use save::{get_save_path, load_save, save_game};
@@ -155,9 +155,49 @@ fn print_usage(program: &str) {
 /// We probe rather than trust an ioctl/winsize because a door's pty size is
 /// frozen at launch (and an inherited socket has no winsize at all), so this
 /// round-trip is the only way to track the caller's real terminal size.
-pub(crate) fn send_size_probe<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+///
+/// When `with_caps` is set, the keyboard-capability probes are folded into the
+/// same round-trip (sent until detection resolves, see `Input::caps_resolved`):
+/// CTerm Device Attributes (`CSI < c` — physical key reports), the kitty keyboard
+/// query (`CSI ? u`), and a Primary DA (`CSI c`) that acts as the reply barrier.
+/// Terminals that don't understand a query simply ignore it; all replies are
+/// parsed by `KeyDecoder` and never surface as keystrokes.
+pub(crate) fn send_size_probe<W: Write + ?Sized>(term: &mut W, with_caps: bool) -> io::Result<()> {
     emit!(term, MoveTo(9998, 9998))?;
     term.write_all(b"\x1b[6n")?;
+    if with_caps {
+        term.write_all(b"\x1b[<c\x1b[?u\x1b[c")?;
+    }
+    term.flush()
+}
+
+/// Resolve which keyboard protocol the caller speaks. Detection normally
+/// completes during the menu (its size probes carry the capability queries);
+/// for a direct ROM launch with no menu, pump input briefly — swallowing the
+/// probe replies — until the DA barrier arrives or a short timeout elapses.
+fn detect_keyboard(term: &mut dyn Term, input: &mut Input) -> io::Result<KeyboardMode> {
+    if !input.caps_resolved() {
+        let _ = send_size_probe(&mut *term, true);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while !input.caps_resolved() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+            let _ = input.poll(term)?; // feed the replies (no game keys yet)
+        }
+    }
+    Ok(input.keyboard_mode())
+}
+
+/// Enable CTerm physical key reports (`CSI = 1 h`) and suppress the duplicate
+/// translated input (`CSI = 2 h`) so the game reads only raw evdev edges.
+fn enable_physical_keys<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+    term.write_all(b"\x1b[=1h\x1b[=2h")?;
+    term.flush()
+}
+
+/// Restore normal translated input (`CSI = 2 l`) and stop physical key reports
+/// (`CSI = 1 l`). Safe to call even if they were never enabled.
+fn disable_physical_keys<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+    term.write_all(b"\x1b[=1l\x1b[=2l")?;
     term.flush()
 }
 
@@ -312,6 +352,10 @@ fn main() -> io::Result<()> {
     );
 
     // Restore the screen no matter how the session ended; Term drop restores raw.
+    // Also force-restore translated keyboard input in case a game exited via an
+    // error path before disabling physical key reports — otherwise the caller's
+    // BBS keyboard would stay suppressed after the door returns.
+    let _ = disable_physical_keys(&mut *term);
     let _ = emit!(term, Show, LeaveAlternateScreen);
     let _ = term.flush();
     result
@@ -433,7 +477,14 @@ fn run_game(
     let config = RenderConfig { mode };
     let mut renderer = Renderer::new(config);
     renderer.update_dimensions(80, 24);
-    let _ = send_size_probe(&mut *term);
+    let _ = send_size_probe(&mut *term, !input.caps_resolved());
+
+    // Resolve the keyboard protocol and, for SyncTERM/CTerm, switch on physical
+    // key reports so the game gets real key-down/up edges and simultaneous keys.
+    let physical_keys = detect_keyboard(&mut *term, input)? == KeyboardMode::CtermPhysical;
+    if physical_keys {
+        let _ = enable_physical_keys(&mut *term);
+    }
 
     // Use precise floating-point duration for accurate 60 FPS (16.667ms, not 16ms).
     // This paces the *emulator* — the game always runs at full Game Boy speed.
@@ -520,20 +571,38 @@ fn run_game(
             }
         }
 
-        // Input: decode whatever arrived this frame from the connection.
-        for key in input.poll(term)? {
-            match key {
-                Key::Esc | Key::Char('q') | Key::Char('Q') => {
+        // Input. Always poll to feed the decoder. In CtermPhysical mode buttons
+        // are driven by real key edges (exact press/release, simultaneous keys,
+        // no timeout); otherwise the translated-key path with the timeout above.
+        let keys = input.poll(term)?;
+        if physical_keys {
+            let _ = keys; // translated input is suppressed in this mode
+            for edge in input.take_key_edges() {
+                if let Some(button) = evdev_to_button(edge.code) {
+                    if edge.pressed {
+                        gameboy.press_button(button);
+                    } else {
+                        gameboy.release_button(button);
+                    }
+                } else if edge.pressed && (edge.code == EVDEV_ESC || edge.code == EVDEV_Q) {
                     running = false;
-                    break;
                 }
-                k => {
-                    if let Some(button) = map_key_to_button(k) {
-                        let idx = button_index(button);
-                        let is_new = button_last_seen[idx].is_none();
-                        button_last_seen[idx] = Some(Instant::now());
-                        if is_new {
-                            gameboy.press_button(button);
+            }
+        } else {
+            for key in keys {
+                match key {
+                    Key::Esc | Key::Char('q') | Key::Char('Q') => {
+                        running = false;
+                        break;
+                    }
+                    k => {
+                        if let Some(button) = map_key_to_button(k) {
+                            let idx = button_index(button);
+                            let is_new = button_last_seen[idx].is_none();
+                            button_last_seen[idx] = Some(Instant::now());
+                            if is_new {
+                                gameboy.press_button(button);
+                            }
                         }
                     }
                 }
@@ -561,10 +630,11 @@ fn run_game(
             }
         }
         // Re-probe ~1/sec, but not while the link is saturated (its blocking
-        // write would stall the loop just like a frame).
+        // write would stall the loop just like a frame). Keep folding in the
+        // capability probes until keyboard detection resolves.
         if !pace.skipping() && size_timer.elapsed() >= Duration::from_millis(1000) {
             size_timer = Instant::now();
-            let _ = send_size_probe(&mut *term);
+            let _ = send_size_probe(&mut *term, !input.caps_resolved());
         }
 
         // Advance the simulation to wall-clock: run every GB frame whose time
@@ -686,6 +756,11 @@ fn run_game(
     // menu (the latency "tail").
     if let Some(a) = apc.as_mut() {
         let _ = a.stop(&mut *term);
+    }
+
+    // Restore translated input for the menu (no-op if it was never enabled).
+    if physical_keys {
+        let _ = disable_physical_keys(&mut *term);
     }
 
     // Save game on exit

@@ -44,12 +44,39 @@ enum State {
     IacSubIac, // inside SB, saw IAC, awaiting SE
 }
 
+/// Which keyboard-input protocol the connected terminal supports, resolved from
+/// the startup capability probes (folded into the size-probe handshake). Selects
+/// how key edges are read; `Legacy` is the universal fallback (translated keys +
+/// the button-release timeout).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyboardMode {
+    /// SyncTERM/CTerm physical key reports (`CSI = 1 h`, evdev `K`/`k` edges).
+    CtermPhysical,
+    /// Kitty keyboard protocol (`CSI > flags u`, CSI-u events with press/release).
+    Kitty,
+    /// No enhanced protocol: translated keys only.
+    Legacy,
+}
+
+/// A physical key edge from a CTerm physical-key report (`CSI = Pk;… K|k`):
+/// the evdev key code and whether it went down (`pressed`) or up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyEdge {
+    pub code: u16,
+    pub pressed: bool,
+}
+
 pub struct KeyDecoder {
     state: State,
     cr_seen: bool,             // swallow the LF/NUL that may follow a CR
     csi: String,               // accumulated CSI parameter bytes
     cursor: Option<(u16, u16)>, // last cursor-position report (row, col)
     audio_drain: Option<u8>,   // channel from a `CSI =7;ch;0 n` drain report
+    // Keyboard capability flags, set as the probe replies arrive.
+    phys_keys: bool,           // CTDA (`CSI < ... c`) advertised value 8
+    kitty_keys: bool,          // kitty query reply (`CSI ? flags u`)
+    da1_seen: bool,            // Primary DA reply (`CSI ? ... c`) — the probe barrier
+    key_edges: Vec<KeyEdge>,   // physical key press/release edges awaiting the caller
 }
 
 impl Default for KeyDecoder {
@@ -60,6 +87,10 @@ impl Default for KeyDecoder {
             csi: String::new(),
             cursor: None,
             audio_drain: None,
+            phys_keys: false,
+            kitty_keys: false,
+            da1_seen: false,
+            key_edges: Vec::new(),
         }
     }
 }
@@ -99,6 +130,41 @@ impl KeyDecoder {
     /// channel's FIFO emptied since the last call. Returns the channel number.
     pub fn take_audio_drain(&mut self) -> Option<u8> {
         self.audio_drain.take()
+    }
+
+    /// The keyboard protocol resolved from the capability probes. CTerm physical
+    /// keys win over kitty if a terminal somehow advertised both.
+    pub fn keyboard_mode(&self) -> KeyboardMode {
+        if self.phys_keys {
+            KeyboardMode::CtermPhysical
+        } else if self.kitty_keys {
+            KeyboardMode::Kitty
+        } else {
+            KeyboardMode::Legacy
+        }
+    }
+
+    /// True once the Primary DA reply (the probe barrier) has arrived, so the
+    /// capability probes need not be re-sent with further size probes.
+    pub fn caps_resolved(&self) -> bool {
+        self.da1_seen
+    }
+
+    /// Parse the evdev codes from a physical-key report body (`= Pk;Pk…`) into
+    /// edges. Bodies without the `=` prefix aren't physical reports — ignore them.
+    fn push_key_edges(&mut self, pressed: bool) {
+        if let Some(rest) = self.csi.strip_prefix('=') {
+            for p in rest.split(';') {
+                if let Ok(code) = p.parse::<u16>() {
+                    self.key_edges.push(KeyEdge { code, pressed });
+                }
+            }
+        }
+    }
+
+    /// Drain the physical key edges decoded since the last call (CtermPhysical mode).
+    pub fn take_key_edges(&mut self) -> Vec<KeyEdge> {
+        std::mem::take(&mut self.key_edges)
     }
 
     fn step(&mut self, b: u8, out: &mut Vec<Key>) {
@@ -148,6 +214,26 @@ impl KeyDecoder {
                                 self.audio_drain = Some(ch);
                             }
                         }
+                        b'c' => {
+                            // Device Attributes replies (folded into the size probe).
+                            // `CSI < ...;8;... c` = CTerm CTDA (physical keys avail);
+                            // `CSI ? ... c` = Primary DA, our probe barrier.
+                            if let Some(rest) = self.csi.strip_prefix('<') {
+                                if rest.split(';').any(|p| p == "8") {
+                                    self.phys_keys = true;
+                                }
+                            } else if self.csi.starts_with('?') {
+                                self.da1_seen = true;
+                            }
+                        }
+                        b'u' => {
+                            // Kitty keyboard query reply: `CSI ? <flags> u`.
+                            if self.csi.starts_with('?') {
+                                self.kitty_keys = true;
+                            }
+                        }
+                        b'K' => self.push_key_edges(true),  // `CSI = Pk;… K` press
+                        b'k' => self.push_key_edges(false), // `CSI = Pk;… k` release
                         _ => {} // Home/End/PgUp/~-sequences etc.: ignored
                     }
                     self.state = State::Ground;
@@ -288,6 +374,22 @@ impl Input {
     pub fn take_audio_drain(&mut self) -> Option<u8> {
         self.decoder.take_audio_drain()
     }
+
+    /// The keyboard protocol resolved from the startup capability probes.
+    pub fn keyboard_mode(&self) -> KeyboardMode {
+        self.decoder.keyboard_mode()
+    }
+
+    /// True once detection is complete (Primary DA barrier seen): stop folding
+    /// the capability queries into subsequent size probes.
+    pub fn caps_resolved(&self) -> bool {
+        self.decoder.caps_resolved()
+    }
+
+    /// Drain physical key edges decoded since the last call (CtermPhysical mode).
+    pub fn take_key_edges(&mut self) -> Vec<KeyEdge> {
+        self.decoder.take_key_edges()
+    }
 }
 
 /// What `Input::wait_event` returned: a keypress, the terminal's (rows, cols)
@@ -312,6 +414,52 @@ mod tests {
         assert_eq!(d.feed(b"\x1b[24;80R"), []); // no key emitted
         assert_eq!(d.take_cursor(), Some((24, 80)));
         assert_eq!(d.take_cursor(), None);
+    }
+
+    #[test]
+    fn physical_key_reports_decode_to_edges_not_keys() {
+        let mut d = KeyDecoder::new();
+        // Two keys pressed together, then one released — no Key output.
+        assert_eq!(d.feed(b"\x1b[=44;45K"), []);
+        assert_eq!(d.feed(b"\x1b[=44k"), []);
+        let edges = d.take_key_edges();
+        assert_eq!(edges.len(), 3);
+        assert_eq!(edges[0], KeyEdge { code: 44, pressed: true });
+        assert_eq!(edges[1], KeyEdge { code: 45, pressed: true });
+        assert_eq!(edges[2], KeyEdge { code: 44, pressed: false });
+        assert!(d.take_key_edges().is_empty(), "edges drained");
+        // An audio drain report (also `=`-prefixed) is not a key edge.
+        d.feed(b"\x1b[=7;2;0n");
+        assert!(d.take_key_edges().is_empty());
+        assert_eq!(d.take_audio_drain(), Some(2));
+    }
+
+    #[test]
+    fn caps_probe_replies_resolve_keyboard_mode_not_keyed() {
+        // SyncTERM: CTDA advertises 8, then the Primary DA barrier.
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1b[<0;5;6;7;8c"), []);
+        assert_eq!(d.keyboard_mode(), KeyboardMode::CtermPhysical);
+        assert!(!d.caps_resolved(), "not resolved until the DA1 barrier");
+        assert_eq!(d.feed(b"\x1b[?62;1;6c"), []);
+        assert!(d.caps_resolved());
+
+        // Kitty terminal: query reply, then DA1; no CTDA-8.
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1b[?0u\x1b[?62c"), []);
+        assert_eq!(d.keyboard_mode(), KeyboardMode::Kitty);
+        assert!(d.caps_resolved());
+
+        // Dumb terminal: only Primary DA -> legacy fallback.
+        let mut d = KeyDecoder::new();
+        d.feed(b"\x1b[?62;1;6c");
+        assert_eq!(d.keyboard_mode(), KeyboardMode::Legacy);
+        assert!(d.caps_resolved());
+
+        // CTDA present but without 8 -> not physical.
+        let mut d = KeyDecoder::new();
+        d.feed(b"\x1b[<0;5;6;7c\x1b[?62c");
+        assert_eq!(d.keyboard_mode(), KeyboardMode::Legacy);
     }
 
     #[test]
