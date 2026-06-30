@@ -77,6 +77,7 @@ pub struct KeyDecoder {
     kitty_keys: bool,          // kitty query reply (`CSI ? flags u`)
     da1_seen: bool,            // Primary DA reply (`CSI ? ... c`) — the probe barrier
     key_edges: Vec<KeyEdge>,   // physical key press/release edges awaiting the caller
+    kitty_active: bool,        // kitty mode enabled: route CSI-u/arrow events to edges
 }
 
 impl Default for KeyDecoder {
@@ -91,6 +92,7 @@ impl Default for KeyDecoder {
             kitty_keys: false,
             da1_seen: false,
             key_edges: Vec::new(),
+            kitty_active: false,
         }
     }
 }
@@ -162,9 +164,41 @@ impl KeyDecoder {
         }
     }
 
-    /// Drain the physical key edges decoded since the last call (CtermPhysical mode).
+    /// Drain the physical key edges decoded since the last call (edge modes).
     pub fn take_key_edges(&mut self) -> Vec<KeyEdge> {
         std::mem::take(&mut self.key_edges)
+    }
+
+    /// Enable/disable kitty event decoding (set when the door pushes the kitty
+    /// keyboard flags). While on, CSI-u and arrow events become key edges instead
+    /// of translated keys.
+    pub fn set_kitty_active(&mut self, on: bool) {
+        self.kitty_active = on;
+    }
+
+    /// Push an edge from a kitty CSI-u key event (`CSI codepoint ; mods:event u`),
+    /// normalising the Unicode keysym to the same evdev code space as CTerm.
+    fn push_kitty_u(&mut self) {
+        let cp = self
+            .csi
+            .split(';')
+            .next()
+            .and_then(|f| f.split(':').next())
+            .and_then(|s| s.parse::<u32>().ok());
+        if let Some(code) = cp.and_then(kitty_cp_to_evdev) {
+            self.key_edges.push(KeyEdge { code, pressed: kitty_event(&self.csi) != 3 });
+        }
+    }
+
+    /// Push an edge from a kitty arrow event (final byte `A`..`D`).
+    fn push_kitty_arrow(&mut self, final_byte: u8) {
+        let code = match final_byte {
+            b'A' => 103, // up
+            b'B' => 108, // down
+            b'C' => 106, // right
+            _ => 105,    // left (D)
+        };
+        self.key_edges.push(KeyEdge { code, pressed: kitty_event(&self.csi) != 3 });
     }
 
     fn step(&mut self, b: u8, out: &mut Vec<Key>) {
@@ -202,6 +236,10 @@ impl KeyDecoder {
             State::Csi => {
                 if (0x40..=0x7e).contains(&b) {
                     match b {
+                        b'A' | b'B' | b'C' | b'D' if self.kitty_active => {
+                            // Kitty arrow event (`CSI 1 ; mods:event A..D`).
+                            self.push_kitty_arrow(b);
+                        }
                         b'A' => out.push(Key::Up),
                         b'B' => out.push(Key::Down),
                         b'C' => out.push(Key::Right),
@@ -227,9 +265,12 @@ impl KeyDecoder {
                             }
                         }
                         b'u' => {
-                            // Kitty keyboard query reply: `CSI ? <flags> u`.
                             if self.csi.starts_with('?') {
+                                // Kitty keyboard query reply: `CSI ? <flags> u`.
                                 self.kitty_keys = true;
+                            } else if self.kitty_active {
+                                // Kitty key event: `CSI codepoint ; mods:event u`.
+                                self.push_kitty_u();
                             }
                         }
                         b'K' => self.push_key_edges(true),  // `CSI = Pk;… K` press
@@ -287,6 +328,30 @@ fn parse_cursor(params: &str) -> Option<(u16, u16)> {
     let row = it.next()?.parse().ok()?;
     let col = it.next()?.parse().ok()?;
     Some((row, col))
+}
+
+/// Kitty event-type from a CSI body: the colon-suffix of the 2nd `;`-field
+/// (`key ; mods:event ; text`). 1=press, 2=repeat, 3=release; default 1.
+fn kitty_event(csi: &str) -> u8 {
+    csi.split(';')
+        .nth(1)
+        .and_then(|mods| mods.split_once(':'))
+        .and_then(|(_, ev)| ev.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Map a kitty Unicode keysym to the evdev code space used by the edge decoder,
+/// for the keys this door cares about (Z/X/Enter/Space and the Esc/Q quit keys).
+fn kitty_cp_to_evdev(cp: u32) -> Option<u16> {
+    Some(match cp {
+        122 => 44, // z -> Z (A)
+        120 => 45, // x -> X (B)
+        13 => 28,  // Enter (Start)
+        32 => 57,  // Space (Select)
+        27 => 1,   // Esc (quit)
+        113 => 16, // q (quit)
+        _ => return None,
+    })
 }
 
 /// Parse an audio status report body. The terminal answers `CSI = 7 [ ; id ;
@@ -386,9 +451,15 @@ impl Input {
         self.decoder.caps_resolved()
     }
 
-    /// Drain physical key edges decoded since the last call (CtermPhysical mode).
+    /// Drain physical key edges decoded since the last call (edge modes).
     pub fn take_key_edges(&mut self) -> Vec<KeyEdge> {
         self.decoder.take_key_edges()
+    }
+
+    /// Enable/disable kitty event decoding (set when the door pushes the kitty
+    /// keyboard flags).
+    pub fn set_kitty_active(&mut self, on: bool) {
+        self.decoder.set_kitty_active(on);
     }
 }
 
@@ -432,6 +503,28 @@ mod tests {
         d.feed(b"\x1b[=7;2;0n");
         assert!(d.take_key_edges().is_empty());
         assert_eq!(d.take_audio_drain(), Some(2));
+    }
+
+    #[test]
+    fn kitty_events_decode_to_evdev_edges_when_active() {
+        let mut d = KeyDecoder::new();
+        // Before activation, arrows are still plain translated keys.
+        assert_eq!(d.feed(b"\x1b[1;1:1A"), [Key::Up]);
+        d.set_kitty_active(true);
+        // z press, z release, Up press, Up release, Space press.
+        assert_eq!(d.feed(b"\x1b[122;1:1u"), []);
+        assert_eq!(d.feed(b"\x1b[122;1:3u"), []);
+        assert_eq!(d.feed(b"\x1b[1;1:1A"), []);
+        assert_eq!(d.feed(b"\x1b[1;1:3A"), []);
+        assert_eq!(d.feed(b"\x1b[32u"), []); // no event field -> press
+        let e = d.take_key_edges();
+        assert_eq!(e, vec![
+            KeyEdge { code: 44, pressed: true },   // z down
+            KeyEdge { code: 44, pressed: false },  // z up
+            KeyEdge { code: 103, pressed: true },  // up down
+            KeyEdge { code: 103, pressed: false }, // up up
+            KeyEdge { code: 57, pressed: true },   // space down
+        ]);
     }
 
     #[test]

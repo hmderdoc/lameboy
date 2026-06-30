@@ -201,6 +201,19 @@ fn disable_physical_keys<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
     term.flush()
 }
 
+/// Push the kitty keyboard flags `2|8` (report event types + all keys as escape
+/// codes) so modern terminals send press/release edges for every key.
+fn enable_kitty_keys<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+    term.write_all(b"\x1b[>10u")?;
+    term.flush()
+}
+
+/// Pop the kitty keyboard flags (`CSI < u`), restoring the host's prior mode.
+fn disable_kitty_keys<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
+    term.write_all(b"\x1b[<u")?;
+    term.flush()
+}
+
 /// Ask the terminal to resize its text area to `rows`x`cols` (xterm
 /// `CSI 8 ; rows ; cols t`). xterm-family terminals honor it; SyncTERM/CTerm
 /// ignore it harmlessly (their `CSI ... t` is 24-bit colour and needs 4 params).
@@ -353,9 +366,10 @@ fn main() -> io::Result<()> {
 
     // Restore the screen no matter how the session ended; Term drop restores raw.
     // Also force-restore translated keyboard input in case a game exited via an
-    // error path before disabling physical key reports — otherwise the caller's
-    // BBS keyboard would stay suppressed after the door returns.
+    // error path before turning off an enhanced keyboard mode — otherwise the
+    // caller's BBS keyboard would stay suppressed after the door returns.
     let _ = disable_physical_keys(&mut *term);
+    let _ = disable_kitty_keys(&mut *term);
     let _ = emit!(term, Show, LeaveAlternateScreen);
     let _ = term.flush();
     result
@@ -479,11 +493,21 @@ fn run_game(
     renderer.update_dimensions(80, 24);
     let _ = send_size_probe(&mut *term, !input.caps_resolved());
 
-    // Resolve the keyboard protocol and, for SyncTERM/CTerm, switch on physical
-    // key reports so the game gets real key-down/up edges and simultaneous keys.
-    let physical_keys = detect_keyboard(&mut *term, input)? == KeyboardMode::CtermPhysical;
-    if physical_keys {
-        let _ = enable_physical_keys(&mut *term);
+    // Resolve the keyboard protocol and switch on the enhanced mode if any:
+    // CtermPhysical (SyncTERM) or Kitty (modern terminals) both yield real
+    // key-down/up edges and simultaneous keys; the decoder normalises kitty to
+    // the same evdev codes, so the in-game edge path is shared.
+    let kb_mode = detect_keyboard(&mut *term, input)?;
+    let edge_input = matches!(kb_mode, KeyboardMode::CtermPhysical | KeyboardMode::Kitty);
+    match kb_mode {
+        KeyboardMode::CtermPhysical => {
+            let _ = enable_physical_keys(&mut *term);
+        }
+        KeyboardMode::Kitty => {
+            let _ = enable_kitty_keys(&mut *term);
+            input.set_kitty_active(true);
+        }
+        KeyboardMode::Legacy => {}
     }
 
     // Use precise floating-point duration for accurate 60 FPS (16.667ms, not 16ms).
@@ -575,8 +599,8 @@ fn run_game(
         // are driven by real key edges (exact press/release, simultaneous keys,
         // no timeout); otherwise the translated-key path with the timeout above.
         let keys = input.poll(term)?;
-        if physical_keys {
-            let _ = keys; // translated input is suppressed in this mode
+        if edge_input {
+            let _ = keys; // translated input is suppressed/replaced in edge modes
             for edge in input.take_key_edges() {
                 if let Some(button) = evdev_to_button(edge.code) {
                     if edge.pressed {
@@ -759,8 +783,15 @@ fn run_game(
     }
 
     // Restore translated input for the menu (no-op if it was never enabled).
-    if physical_keys {
-        let _ = disable_physical_keys(&mut *term);
+    match kb_mode {
+        KeyboardMode::CtermPhysical => {
+            let _ = disable_physical_keys(&mut *term);
+        }
+        KeyboardMode::Kitty => {
+            let _ = disable_kitty_keys(&mut *term);
+            input.set_kitty_active(false);
+        }
+        KeyboardMode::Legacy => {}
     }
 
     // Save game on exit
