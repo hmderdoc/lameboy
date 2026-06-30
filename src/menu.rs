@@ -408,7 +408,9 @@ impl MenuState {
         let rom_files = scan_for_roms(&roms_dir);
 
         let mut state = Self {
-            render_mode: if saved.render_block.unwrap_or(false) {
+            // New users default to Block (the richer renderer); a saved choice
+            // (Some(true/false)) always wins.
+            render_mode: if saved.render_block.unwrap_or(true) {
                 RenderMode::Block
             } else {
                 RenderMode::Ascii
@@ -420,7 +422,9 @@ impl MenuState {
             rom_files,
             filtered: Vec::new(),
             selected_rom_index: 0,
-            current_section: MenuSection::RenderMode,
+            // Open focused on the game list (this state is rebuilt on every menu
+            // entry, so it also lands here after a game exits), not the settings.
+            current_section: MenuSection::GameList,
             last_settings: MenuSection::RenderMode,
             scroll_offset: 0,
             visible_rows: VISIBLE_ROWS,

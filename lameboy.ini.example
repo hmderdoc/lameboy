@@ -17,3 +17,21 @@
 ; Offer ANSI-music sound (the caller still picks Off / ANSI / APC in the menu).
 ; Set false for a silent door / APC-only. Default true.
 ;ansi_music = true
+
+; --- APC audio streaming (SyncTERM PCM) -------------------------------------
+; These tune the real-PCM stream sent to APC-audio terminals. They do nothing
+; for Off / ANSI sound. The stream keeps itself in sync with wall-clock on its
+; own (speeding up small drift, dropping big stalls), so there is no buffer or
+; latency knob to guess at — watch the live "A:" readout in the FPS bar to tune.
+;
+; Output sample rate in Hz (clamped 5512-44100, snapped to a divisor of 44100).
+; This is the bandwidth lever: the audio shares the link with the video, so a
+; lower rate clears faster and is the best fix for latency on a slow link. GB
+; audio is lo-fi, so 11025 sounds nearly identical to 22050 at half the bytes.
+; Default 22050.
+;audio_rate = 22050
+;
+; Smallest clip emitted, in ms (clamped 10-250); also the drop/skip granularity.
+; Smaller = subtler skips and tighter timing, at a little more per-clip overhead.
+; Default 40.
+;audio_chunk_ms = 40

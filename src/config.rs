@@ -122,11 +122,47 @@ pub fn save(user: Option<&str>, cfg: &Config) -> io::Result<()> {
 ///   roms = roms
 ///   fps = 20
 ///   ansi_music = true
+///   audio_chunk_ms = 40
+///   audio_rate = 22050
 #[derive(Default)]
 pub struct DoorIni {
     pub roms: Option<String>,
     pub fps: Option<f64>,
     pub ansi_music: Option<bool>,
+    /// Smallest APC audio clip emitted (ms); also the drop/skip granularity.
+    pub audio_chunk_ms: Option<u32>,
+    /// APC audio output sample rate (Hz); lower = less bandwidth on the link.
+    pub audio_rate: Option<u32>,
+}
+
+/// APC audio stream tuning, sourced from `lameboy.ini` (sysop) with built-in
+/// defaults. `chunk_ms` is the min clip / drop granularity; `rate` is the output
+/// sample rate (the bandwidth lever — lower keeps the link from saturating). The
+/// stream self-corrects latency against wall-clock, so there is no cushion knob.
+#[derive(Clone, Copy)]
+pub struct ApcTuning {
+    pub chunk_ms: u32,
+    pub rate: u32,
+}
+
+impl ApcTuning {
+    pub const DEFAULT: ApcTuning = ApcTuning { chunk_ms: 40, rate: 22050 };
+}
+
+impl Default for ApcTuning {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl DoorIni {
+    /// Resolve APC tuning from the ini, falling back to the built-in defaults.
+    pub fn apc_tuning(&self) -> ApcTuning {
+        ApcTuning {
+            chunk_ms: self.audio_chunk_ms.unwrap_or(ApcTuning::DEFAULT.chunk_ms),
+            rate: self.audio_rate.unwrap_or(ApcTuning::DEFAULT.rate),
+        }
+    }
 }
 
 /// Load `lameboy.ini` if present (working dir first, then the binary's dir).
@@ -167,6 +203,12 @@ fn parse_door_ini(text: &str) -> DoorIni {
                     "1" | "true" | "yes" | "on"
                 ));
             }
+            "audio_chunk_ms" | "chunk_ms" => {
+                ini.audio_chunk_ms = val.parse::<u32>().ok().map(|v| v.clamp(10, 250));
+            }
+            "audio_rate" | "rate" | "audio_hz" => {
+                ini.audio_rate = val.parse::<u32>().ok().map(|v| v.clamp(5512, 44100));
+            }
             _ => {}
         }
     }
@@ -189,5 +231,18 @@ mod tests {
     fn door_ini_fps_is_clamped() {
         assert_eq!(parse_door_ini("fps=999").fps, Some(60.0));
         assert_eq!(parse_door_ini("fps=1").fps, Some(5.0));
+    }
+
+    #[test]
+    fn door_ini_audio_tuning_parses_and_clamps() {
+        let i = parse_door_ini("audio_chunk_ms = 60\naudio_rate = 11025\n");
+        assert_eq!(i.audio_chunk_ms, Some(60));
+        assert_eq!(i.audio_rate, Some(11025));
+        // Out-of-range values clamp to the supported window.
+        assert_eq!(parse_door_ini("audio_chunk_ms=1").audio_chunk_ms, Some(10));
+        assert_eq!(parse_door_ini("audio_rate=999999").audio_rate, Some(44100));
+        // Unset -> built-in defaults via apc_tuning().
+        let d = DoorIni::default().apc_tuning();
+        assert_eq!((d.chunk_ms, d.rate), (40, 22050));
     }
 }

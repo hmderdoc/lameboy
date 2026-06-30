@@ -14,3 +14,6 @@
 # ANSI capture dumps (local debugging scratch, not part of the source)
 /menu.bin
 /music_cap.bin
+
+# APC audio diagnostics log (runtime artifact, truncated each session)
+/apc_audio.log

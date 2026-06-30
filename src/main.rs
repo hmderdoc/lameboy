@@ -235,6 +235,8 @@ fn main() -> io::Result<()> {
     // Sysop defaults from lameboy.ini (next to the binary). Command-line flags
     // override these, so the usual door command line stays short.
     let ini = config::load_door_ini();
+    // Capture before `ini` is partially moved (roms) below.
+    let apc_tuning = ini.apc_tuning();
 
     // The released door build has no local audio device, so --mute is effectively
     // always on; it's still honored for `localaudio` builds and back-compat.
@@ -306,6 +308,7 @@ fn main() -> io::Result<()> {
         user_id.as_deref(),
         roms_override.as_deref(),
         render_fps,
+        apc_tuning,
     );
 
     // Restore the screen no matter how the session ended; Term drop restores raw.
@@ -327,12 +330,13 @@ fn run_session(
     user_id: Option<&str>,
     roms_override: Option<&str>,
     render_fps: f64,
+    apc_tuning: config::ApcTuning,
 ) -> io::Result<()> {
     if let Some(rom) = positional_rom {
         let mode = cli_mode.unwrap_or(RenderMode::Ascii);
         return run_game(
             term, input, &Path::new(&rom).to_path_buf(), mode,
-            !force_mute, ansi_music_flag, false, user_id, render_fps,
+            !force_mute, ansi_music_flag, false, user_id, render_fps, apc_tuning,
         );
     }
 
@@ -354,7 +358,7 @@ fn run_session(
                 let music_enabled = ansi_music_flag && config.sound == SoundMode::Ansi;
                 run_game(
                     term, input, &config.rom_path, mode, audio_enabled,
-                    music_enabled, want_apc, user_id, render_fps,
+                    music_enabled, want_apc, user_id, render_fps, apc_tuning,
                 )?;
                 animate = false;
             }
@@ -381,6 +385,7 @@ fn run_game(
     apc_enabled: bool,
     user_id: Option<&str>,
     render_fps: f64,
+    apc_tuning: config::ApcTuning,
 ) -> io::Result<()> {
     let rom = std::fs::read(rom_path).expect("Failed to read ROM file");
 
@@ -468,14 +473,26 @@ fn run_game(
 
     // APC PCM streaming: capture the emulator's audio and ship it to a
     // SyncTERM-APC-capable terminal as chunked clips (~120 ms).
+    // Monotonic clock for the APC audio timeline (realtime playback estimate).
+    let audio_clock = Instant::now();
     let mut apc = if apc_enabled {
-        // 120 ms chunks, 240 ms pre-roll. The wall-clock loop keeps the stream
-        // fed at realtime, so the cushion only needs to cover brief jitter — a
-        // smaller lead means less audio-vs-video latency. Raise if gaps return.
-        Some(apc_audio::ApcAudio::new(120, 240))
+        // The streamer reconciles each clip against wall-clock (speed up small
+        // drift, drop big stalls), so there is no cushion to tune. chunk_ms is the
+        // min clip / drop granularity; rate is the bandwidth lever (lower = fewer
+        // bytes on the shared link). Both are sysop-set in lameboy.ini.
+        Some(apc_audio::ApcAudio::new(apc_tuning.chunk_ms, apc_tuning.rate))
     } else {
         None
     };
+    // APC audio diagnostics go to a file (NOT stdout/stderr — in a door those
+    // are the caller's socket and would corrupt the screen). Best-effort,
+    // truncated each session; absent if it can't be opened.
+    let mut apc_log = if apc.is_some() {
+        std::fs::File::create("apc_audio.log").ok()
+    } else {
+        None
+    };
+    let mut apc_log_timer = Instant::now();
 
     let mut running = true;
     // Track when each button was last seen, to release it on timeout.
@@ -527,6 +544,14 @@ fn run_game(
             break;
         }
 
+        // Audio FIFO drained (underrun): the realtime estimate is stale, so
+        // re-anchor the streamer's timeline to "queued == 0 now".
+        if input.take_audio_drain().is_some() {
+            if let Some(a) = apc.as_mut() {
+                a.notify_drain(&mut *term, audio_clock.elapsed().as_millis() as u64)?;
+            }
+        }
+
         // Apply a terminal-size report if the probe was answered (row;col -> cols,rows).
         if let Some((row, col)) = input.take_cursor() {
             let size = (col, row);
@@ -576,10 +601,23 @@ fn run_game(
             sim_deadline = Instant::now();
         }
 
-        // Ship any full APC audio chunks now, regardless of video pacing, so
-        // sound keeps flowing even while frames are being skipped.
+        // Ship APC audio, reconciled against wall-clock (speed up small drift,
+        // drop big stalls) so sound stays in sync even while video frames skip.
         if let Some(a) = apc.as_mut() {
-            a.emit_ready(&mut *term)?;
+            let now_ms = audio_clock.elapsed().as_millis() as u64;
+            a.emit_ready(&mut *term, now_ms)?;
+            // Log stream health ~1/sec to the file (survives frame-skip).
+            if apc_log_timer.elapsed() >= Duration::from_secs(1) {
+                apc_log_timer = Instant::now();
+                if let Some(f) = apc_log.as_mut() {
+                    let s = a.stats(now_ms);
+                    let _ = writeln!(
+                        f,
+                        "rate={}Hz lead={}ms drift={:+.2}% cor={:+.2}% drops={}",
+                        s.rate, s.lead_ms, s.drift_pct, s.correction_pct, s.drops
+                    );
+                }
+            }
         }
 
         // Start local audio playback after pre-buffering (localaudio builds only;
@@ -615,7 +653,9 @@ fn run_game(
                 ansi.update(gameboy.get_sound(), &mut *term);
                 renderer.render(&framebuffer, &mut *term)?;
 
-                // FPS overlay (transmitted frame rate), at most once/sec.
+                // FPS overlay (transmitted frame rate), at most once/sec. APC
+                // audio diagnostics go to the log only (see emit below), not the
+                // screen, to keep the status bar from overflowing.
                 frame_count += 1;
                 let fps_elapsed = fps_timer.elapsed();
                 if fps_elapsed >= Duration::from_secs(1) {
@@ -642,9 +682,10 @@ fn run_game(
         }
     }
 
-    // Emit any trailing partial audio chunk before returning to the menu.
+    // Flush the channel FIFO so no queued audio plays after we return to the
+    // menu (the latency "tail").
     if let Some(a) = apc.as_mut() {
-        let _ = a.flush(&mut *term);
+        let _ = a.stop(&mut *term);
     }
 
     // Save game on exit

@@ -49,11 +49,18 @@ pub struct KeyDecoder {
     cr_seen: bool,             // swallow the LF/NUL that may follow a CR
     csi: String,               // accumulated CSI parameter bytes
     cursor: Option<(u16, u16)>, // last cursor-position report (row, col)
+    audio_drain: Option<u8>,   // channel from a `CSI =7;ch;0 n` drain report
 }
 
 impl Default for KeyDecoder {
     fn default() -> Self {
-        Self { state: State::Ground, cr_seen: false, csi: String::new(), cursor: None }
+        Self {
+            state: State::Ground,
+            cr_seen: false,
+            csi: String::new(),
+            cursor: None,
+            audio_drain: None,
+        }
     }
 }
 
@@ -86,6 +93,12 @@ impl KeyDecoder {
     /// terminal answered our size probe since the last call.
     pub fn take_cursor(&mut self) -> Option<(u16, u16)> {
         self.cursor.take()
+    }
+
+    /// Take the most recent audio drain report (`CSI = 7 ; ch ; 0 n`): the
+    /// channel's FIFO emptied since the last call. Returns the channel number.
+    pub fn take_audio_drain(&mut self) -> Option<u8> {
+        self.audio_drain.take()
     }
 
     fn step(&mut self, b: u8, out: &mut Vec<Key>) {
@@ -129,6 +142,12 @@ impl KeyDecoder {
                         b'D' => out.push(Key::Left),
                         b'Z' => out.push(Key::BackTab),
                         b'R' => self.cursor = parse_cursor(&self.csi), // size probe reply
+                        b'n' => {
+                            // Device-status report; `=7;ch;0` is an audio drain.
+                            if let Some(ch) = parse_audio_drain(&self.csi) {
+                                self.audio_drain = Some(ch);
+                            }
+                        }
                         _ => {} // Home/End/PgUp/~-sequences etc.: ignored
                     }
                     self.state = State::Ground;
@@ -182,6 +201,20 @@ fn parse_cursor(params: &str) -> Option<(u16, u16)> {
     let row = it.next()?.parse().ok()?;
     let col = it.next()?.parse().ok()?;
     Some((row, col))
+}
+
+/// Parse an audio status report body. The terminal answers `CSI = 7 [ ; id ;
+/// state ]… n` (state 0 = stopped, 1 = running); the `Update;C=` one-shot fires
+/// `=7;ch;0`. Returns the first channel reported stopped, if any.
+fn parse_audio_drain(params: &str) -> Option<u8> {
+    let rest = params.strip_prefix("=7")?;
+    let mut it = rest.split(';').filter(|s| !s.is_empty());
+    while let (Some(id), Some(state)) = (it.next(), it.next()) {
+        if state == "0" {
+            return id.parse().ok();
+        }
+    }
+    None
 }
 
 /// Reads bytes from a `Term` and decodes them into keys — the input side of the
@@ -250,6 +283,11 @@ impl Input {
     pub fn take_cursor(&mut self) -> Option<(u16, u16)> {
         self.decoder.take_cursor()
     }
+
+    /// Take the most recent audio drain report, if the terminal sent one.
+    pub fn take_audio_drain(&mut self) -> Option<u8> {
+        self.decoder.take_audio_drain()
+    }
 }
 
 /// What `Input::wait_event` returned: a keypress, the terminal's (rows, cols)
@@ -274,6 +312,18 @@ mod tests {
         assert_eq!(d.feed(b"\x1b[24;80R"), []); // no key emitted
         assert_eq!(d.take_cursor(), Some((24, 80)));
         assert_eq!(d.take_cursor(), None);
+    }
+
+    #[test]
+    fn audio_drain_report_is_captured_not_keyed() {
+        let mut d = KeyDecoder::new();
+        // Update one-shot for channel 2 going idle: ESC [ = 7 ; 2 ; 0 n
+        assert_eq!(d.feed(b"\x1b[=7;2;0n"), []); // no key emitted
+        assert_eq!(d.take_audio_drain(), Some(2));
+        assert_eq!(d.take_audio_drain(), None);
+        // A "running" report (state 1) is not a drain.
+        assert_eq!(d.feed(b"\x1b[=7;2;1n"), []);
+        assert_eq!(d.take_audio_drain(), None);
     }
 
     #[test]
