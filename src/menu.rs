@@ -384,6 +384,30 @@ fn draw_caret<W: Write + ?Sized>(stdout: &mut W, active: bool, active_fg: Color)
     }
 }
 
+/// Draw a "══ Label ══" zone header. The flanking `══` blink when this zone holds
+/// the cursor (Settings vs Games), a second at-a-glance cue for which menu you're
+/// on; the label itself stays steady. Exactly one zone is active at a time.
+fn draw_zone_header<W: Write + ?Sized>(
+    stdout: &mut W,
+    x: u16,
+    y: u16,
+    label: &str,
+    active: bool,
+) -> io::Result<()> {
+    emit!(stdout, MoveTo(x, y), SetForegroundColor(ACCENT_COLOR))?;
+    if active {
+        emit!(
+            stdout,
+            SetAttribute(Attribute::SlowBlink), Print("══"), SetAttribute(Attribute::NoBlink),
+            Print(format!(" {} ", label)),
+            SetAttribute(Attribute::SlowBlink), Print("══"), SetAttribute(Attribute::NoBlink),
+            NORMAL
+        )
+    } else {
+        emit!(stdout, Print(format!("══ {} ══", label)), NORMAL)
+    }
+}
+
 /// Brief splash before the menu (first entry only). Kept tiny so it works on a
 /// short screen and doesn't feel like a separate app.
 fn play_startup_animation<W: Write + ?Sized>(stdout: &mut W) -> io::Result<()> {
@@ -492,6 +516,39 @@ impl MenuState {
         } else if self.selected_rom_index >= self.scroll_offset + win {
             self.scroll_offset = self.selected_rom_index + 1 - win;
         }
+    }
+
+    /// Scroll the game list one visible page, keeping the cursor at the SAME row
+    /// within the viewport (so paging feels like turning a page, not jumping the
+    /// selection to the window edge). When already on the first/last page, the
+    /// cursor moves to the very first/last game instead.
+    fn page(&mut self, up: bool) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        self.typeahead.clear();
+        let n = self.filtered.len();
+        let win = self.visible_rows.max(1);
+        let max_off = n.saturating_sub(win); // top offset that still fills the window
+        let rel = self.selected_rom_index.saturating_sub(self.scroll_offset);
+        if up {
+            let new_off = self.scroll_offset.saturating_sub(win);
+            if new_off == self.scroll_offset {
+                self.selected_rom_index = 0; // already at the top page
+            } else {
+                self.scroll_offset = new_off;
+                self.selected_rom_index = self.scroll_offset + rel;
+            }
+        } else {
+            let new_off = (self.scroll_offset + win).min(max_off);
+            if new_off == self.scroll_offset {
+                self.selected_rom_index = n - 1; // already at the bottom page
+            } else {
+                self.scroll_offset = new_off;
+                self.selected_rom_index = (self.scroll_offset + rel).min(n - 1);
+            }
+        }
+        self.ensure_visible();
     }
 
     /// Jump to the first ROM in the filtered list whose name starts with the
@@ -770,18 +827,12 @@ fn run_menu_loop(
                     state.current_section = state.current_section.next();
                 }
             }
-            // Page Up / Page Down move the game list a full visible page at a
-            // time (clamped to the ends) — quick travel through a long library.
+            // Page Up / Page Down scroll the game list a full page, keeping the
+            // cursor at the same relative row in the viewport (SyncTERM sends
+            // CSI V/U; xterm-family sends CSI 5~/6~ — both decode to these keys).
             Key::PageUp | Key::PageDown => {
-                if state.current_section == MenuSection::GameList && !state.filtered.is_empty() {
-                    state.typeahead.clear();
-                    let page = state.visible_rows.max(1);
-                    state.selected_rom_index = if key == Key::PageUp {
-                        state.selected_rom_index.saturating_sub(page)
-                    } else {
-                        (state.selected_rom_index + page).min(state.filtered.len() - 1)
-                    };
-                    state.ensure_visible();
+                if state.current_section == MenuSection::GameList {
+                    state.page(key == Key::PageUp);
                 }
             }
             // Tab jumps between the Settings zone and the game list, keeping the
@@ -897,7 +948,7 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
 
     let settings_x: u16 = 54;
     let zone_settings = state.current_section != MenuSection::GameList;
-    emit!(stdout, MoveTo(settings_x, 3), SetForegroundColor(ACCENT_COLOR), Print("══ Settings ══"), NORMAL)?;
+    draw_zone_header(stdout, settings_x, 3, "Settings", zone_settings)?;
     let render_label = match state.render_mode {
         RenderMode::Ascii => "ASCII",
         RenderMode::Block => "Block",
@@ -923,12 +974,13 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
     }
 
     // Games header + type-ahead indicator.
-    emit!(
+    let games_label = format!("Games: {} ({})", state.filter.label().trim(), state.filtered.len());
+    draw_zone_header(
         stdout,
-        MoveTo(4, GAMES_HEADER_Y),
-        SetForegroundColor(ACCENT_COLOR),
-        Print(format!("══ Games: {} ({}) ══", state.filter.label().trim(), state.filtered.len())),
-        NORMAL
+        4,
+        GAMES_HEADER_Y,
+        &games_label,
+        state.current_section == MenuSection::GameList,
     )?;
     if state.current_section == MenuSection::GameList && !state.typeahead.is_empty() {
         emit!(
@@ -1118,5 +1170,48 @@ mod tests {
         assert!(buf.contains(&0xDB), "block wordmark not emitted");
         // The old blue/yellow scheme must be gone.
         assert!(!contains(&buf, b"\x1b[38;2;255;210;70m"), "stale yellow accent still present");
+    }
+
+    #[test]
+    fn page_keeps_cursor_at_same_viewport_row() {
+        let mut state = MenuState::new(None, None);
+        // A controlled 100-item list in a 10-row viewport.
+        state.filtered = (0..100).collect();
+        state.visible_rows = 10;
+        state.scroll_offset = 40;
+        state.selected_rom_index = 45; // relative row 5 within the viewport
+
+        state.page(false); // page down: scroll a page, keep the cursor on row 5
+        assert_eq!((state.scroll_offset, state.selected_rom_index), (50, 55));
+        state.page(true); // page up: back to exactly where we were
+        assert_eq!((state.scroll_offset, state.selected_rom_index), (40, 45));
+
+        // Already on the last page -> page down lands on the very last game.
+        state.scroll_offset = 90; // max offset (100 items, 10 rows)
+        state.selected_rom_index = 93;
+        state.page(false);
+        assert_eq!(state.selected_rom_index, 99);
+
+        // Already on the first page -> page up lands on the first game.
+        state.scroll_offset = 0;
+        state.selected_rom_index = 4;
+        state.page(true);
+        assert_eq!(state.selected_rom_index, 0);
+    }
+
+    #[test]
+    fn zone_header_blinks_only_when_focused() {
+        let render = |active: bool| -> Vec<u8> {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut w = Cp437Writer::new(&mut buf);
+                draw_zone_header(&mut w, 0, 0, "Settings", active).unwrap();
+            }
+            buf
+        };
+        let blink = b"\x1b[5m"; // SGR SlowBlink wraps the ══ of the focused zone
+        assert!(contains(&render(true), blink), "focused header should blink its ══");
+        assert!(!contains(&render(false), blink), "unfocused header must not blink");
+        assert!(contains(&render(false), b"Settings"), "label still rendered");
     }
 }
