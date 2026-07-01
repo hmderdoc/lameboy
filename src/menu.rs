@@ -27,6 +27,9 @@ pub struct MenuConfig {
     pub color: ColorSetting,
     /// DMG (non-color game) palette: neutral gray or the classic green LCD.
     pub dmg_palette: DmgPalette,
+    /// True when this launch was auto-started by attract mode (idle timeout) rather
+    /// than chosen by the caller — run_game then time-limits it and any key exits.
+    pub attract: bool,
 }
 
 /// Fallback ROM-row count used until the terminal answers a size probe. The live
@@ -786,8 +789,9 @@ impl MenuState {
     }
 
     /// Move the cursor to the ROM whose file name matches `name` exactly (the
-    /// persisted last game). No-op if it's gone or filtered out of the list.
-    fn select_by_filename(&mut self, name: &str) {
+    /// persisted last game). Returns whether it was found in the current view
+    /// (false if it's gone or filtered out).
+    fn select_by_filename(&mut self, name: &str) -> bool {
         if let Some(pos) = self.filtered.iter().position(|&i| {
             self.rom_files[i]
                 .file_name()
@@ -796,7 +800,37 @@ impl MenuState {
         }) {
             self.selected_rom_index = pos;
             self.ensure_visible();
+            true
+        } else {
+            false
         }
+    }
+
+    /// Select a ROM by file name, dropping the filter to "all" if the current
+    /// filter would hide it — so returning from an attract-mode game lands the
+    /// cursor on the game that was playing, even across a filter mismatch.
+    fn select_rom_visible(&mut self, name: &str) {
+        if self.select_by_filename(name) {
+            return;
+        }
+        self.filter = RomFilter::All;
+        self.rebuild_filter();
+        self.select_by_filename(name);
+    }
+
+    /// Pick a random ROM from the current filtered view (for attract mode). None
+    /// if the list is empty. Seeded from the clock's sub-second nanos — plenty of
+    /// spread for launches seconds apart, and no external RNG dependency.
+    fn random_rom(&self) -> Option<PathBuf> {
+        if self.filtered.is_empty() {
+            return None;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let idx = nanos % self.filtered.len();
+        Some(self.rom_files[self.filtered[idx]].clone())
     }
 
     /// Persist render/audio/filter prefs for this user, preserving whatever
@@ -884,8 +918,21 @@ pub fn show_menu(
     screen_orig: &mut Option<(u16, u16)>,
     color_default: ColorSetting,
     dmg_default: DmgPalette,
+    // Attract-mode idle thresholds as (first, subsequent): auto-launch a random
+    // game after `first` of idle, or `subsequent` once the caller has interacted
+    // (a fresh entry uses `first == subsequent`; an inter-attract pause passes a
+    // shorter `first`). None disables attract mode.
+    attract: Option<(Duration, Duration)>,
+    // When set (returning from an attract game the caller took over), open the
+    // list on this ROM instead of the last explicitly-launched one, dropping the
+    // filter if needed to reveal it.
+    select_rom: Option<PathBuf>,
 ) -> io::Result<Option<MenuConfig>> {
     let mut state = MenuState::new(user, roms_override, color_default, dmg_default);
+    // Pre-select the attract game on return, overriding the last-game default.
+    if let Some(name) = select_rom.as_ref().and_then(|p| p.file_name()) {
+        state.select_rom_visible(&name.to_string_lossy());
+    }
     // Seed the color accessors so the startup splash draws at the right depth
     // (refined once the probe answers, on the first menu redraw).
     set_menu_depth(state.resolved_depth);
@@ -897,7 +944,7 @@ pub fn show_menu(
         play_startup_animation(&mut w)?;
     }
 
-    let result = run_menu_loop(term, input, &mut state, screen_orig);
+    let result = run_menu_loop(term, input, &mut state, screen_orig, attract);
     // Drop the LCD background before leaving so it doesn't bleed into the game
     // render or the terminal after the door exits.
     let _ = emit!(term, ResetColor, Clear(ClearType::All));
@@ -936,10 +983,17 @@ fn run_menu_loop(
     input: &mut Input,
     state: &mut MenuState,
     screen_orig: &mut Option<(u16, u16)>,
+    attract: Option<(Duration, Duration)>,
 ) -> io::Result<Option<MenuConfig>> {
     // Tracks the last keystroke time so the type-ahead buffer can reset after
     // a pause. Starts far enough in the past that the first keypress is fresh.
     let mut last_key = Instant::now() - TYPEAHEAD_RESET * 2;
+
+    // Attract mode: measure idle since the last keypress. `interacted` picks the
+    // `subsequent` threshold once the caller has touched a key (so an inter-game
+    // pause reverts to the full idle countdown the moment they engage).
+    let mut idle_start = Instant::now();
+    let mut interacted = false;
 
     // Track the caller's terminal size so the game list fills the screen. It
     // starts at the 80x24 fallback and self-corrects from the first probe reply.
@@ -975,7 +1029,11 @@ fn run_menu_loop(
                 continue 'redraw;
             }
             match input.wait_event(term)? {
-                MenuEvent::Key(k) => break k,
+                MenuEvent::Key(k) => {
+                    idle_start = Instant::now(); // any key resets the attract idle
+                    interacted = true;
+                    break k;
+                }
                 MenuEvent::Resize(rows, cols) => {
                     // Persisted "Best" not yet applied: the reported size is the
                     // pre-resize original — capture it, then resize and re-probe.
@@ -994,6 +1052,22 @@ fn run_menu_loop(
                 // Idle: re-probe so a resize that happened while we sat still is
                 // noticed (its reply arrives as a Resize on the next iteration).
                 MenuEvent::Idle => {
+                    // Attract mode: after enough idle, auto-launch a random game.
+                    if let Some((first, subsequent)) = attract {
+                        let threshold = if interacted { subsequent } else { first };
+                        if idle_start.elapsed() >= threshold {
+                            if let Some(rom_path) = state.random_rom() {
+                                return Ok(Some(MenuConfig {
+                                    rom_path,
+                                    render_mode: state.render_mode,
+                                    sound: state.sound,
+                                    color: state.color,
+                                    dmg_palette: state.dmg_palette,
+                                    attract: true,
+                                }));
+                            }
+                        }
+                    }
                     let _ = crate::send_size_probe(&mut *term, !input.caps_resolved());
                     let _ = term.flush();
                 }
@@ -1136,6 +1210,7 @@ fn run_menu_loop(
                                 sound: state.sound,
                                 color: state.color,
                                 dmg_palette: state.dmg_palette,
+                                attract: false,
                             }));
                         }
                     }

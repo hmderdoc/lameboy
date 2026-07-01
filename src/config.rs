@@ -156,6 +156,12 @@ pub struct DoorIni {
     /// Sysop board-wide default color depth: "auto" | "truecolor" | "256" | "16".
     /// A per-user menu choice overrides it; a caller with no saved pref inherits it.
     pub color: Option<String>,
+    /// Attract ("demo") mode: after some idle time at the menu, auto-launch random
+    /// games until the caller intervenes. `attract = false` disables it.
+    pub attract: Option<bool>,
+    pub attract_idle_secs: Option<u64>, // menu idle before attract launches
+    pub attract_game_secs: Option<u64>, // how long each attract game runs
+    pub attract_menu_secs: Option<u64>, // menu pause between attract games
     /// Smallest APC audio clip emitted (ms); also the drop/skip granularity.
     pub audio_chunk_ms: Option<u32>,
     /// APC audio output sample rate (Hz); lower = less bandwidth on the link.
@@ -182,6 +188,30 @@ impl ApcTuning {
     pub const DEFAULT: ApcTuning = ApcTuning { chunk_ms: 40, rate: 22050, resync_secs: 60 };
 }
 
+/// Attract-mode timing, sourced from `lameboy.ini` (sysop) with built-in defaults.
+/// After `idle_secs` of no input at the menu the door auto-launches a random game
+/// for `game_secs`, pauses at the menu for `menu_secs`, then repeats — until the
+/// caller presses a key, which returns to normal (and re-arms the `idle_secs`
+/// countdown). `enabled = false` turns the whole thing off.
+#[derive(Clone, Copy)]
+pub struct AttractCfg {
+    pub enabled: bool,
+    pub idle_secs: u64,
+    pub game_secs: u64,
+    pub menu_secs: u64,
+}
+
+impl AttractCfg {
+    pub const DEFAULT: AttractCfg =
+        AttractCfg { enabled: true, idle_secs: 30, game_secs: 90, menu_secs: 15 };
+}
+
+impl Default for AttractCfg {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl Default for ApcTuning {
     fn default() -> Self {
         Self::DEFAULT
@@ -195,6 +225,17 @@ impl DoorIni {
             chunk_ms: self.audio_chunk_ms.unwrap_or(ApcTuning::DEFAULT.chunk_ms),
             rate: self.audio_rate.unwrap_or(ApcTuning::DEFAULT.rate),
             resync_secs: self.audio_resync_secs.unwrap_or(ApcTuning::DEFAULT.resync_secs),
+        }
+    }
+
+    /// Resolve attract-mode timing from the ini, clamped to sane ranges.
+    pub fn attract_cfg(&self) -> AttractCfg {
+        let d = AttractCfg::DEFAULT;
+        AttractCfg {
+            enabled: self.attract.unwrap_or(d.enabled),
+            idle_secs: self.attract_idle_secs.unwrap_or(d.idle_secs).clamp(5, 3600),
+            game_secs: self.attract_game_secs.unwrap_or(d.game_secs).clamp(10, 3600),
+            menu_secs: self.attract_menu_secs.unwrap_or(d.menu_secs).clamp(3, 600),
         }
     }
 }
@@ -236,6 +277,15 @@ fn parse_door_ini(text: &str) -> DoorIni {
                     ini.color = Some(val.to_lowercase());
                 }
             }
+            "attract" | "attract_mode" => {
+                ini.attract = Some(matches!(
+                    val.to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                ));
+            }
+            "attract_idle_secs" | "attract_idle" => ini.attract_idle_secs = val.parse().ok(),
+            "attract_game_secs" | "attract_game" => ini.attract_game_secs = val.parse().ok(),
+            "attract_menu_secs" | "attract_menu" => ini.attract_menu_secs = val.parse().ok(),
             "ansi_music" | "ansimusic" | "music" => {
                 ini.ansi_music = Some(matches!(
                     val.to_lowercase().as_str(),

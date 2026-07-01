@@ -27,6 +27,18 @@
 ; Auto never picks 16 on its own; set it here (or in the menu) for 16-color boards.
 ;color = auto
 
+; Attract ("demo") mode: after some idle time at the menu, auto-launch random
+; games until the caller presses a key. Pressing a key during an attract game
+; hands the caller the controls (it becomes a normal session); returning to the
+; menu re-arms the idle countdown. Set attract = false to disable it entirely.
+;attract = true
+; Menu idle before a random game launches (seconds, clamped 5-3600). Default 30.
+;attract_idle_secs = 30
+; How long each attract game runs before the next (seconds, 10-3600). Default 90.
+;attract_game_secs = 90
+; Menu pause shown between attract games (seconds, 3-600). Default 15.
+;attract_menu_secs = 15
+
 ; --- APC audio streaming (SyncTERM PCM) -------------------------------------
 ; These tune the real-PCM stream sent to APC-audio terminals. They do nothing
 ; for Off / ANSI sound. The stream keeps itself in sync with wall-clock on its

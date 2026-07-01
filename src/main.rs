@@ -232,11 +232,35 @@ pub(crate) fn resize_terminal<W: Write + ?Sized>(term: &mut W, rows: u16, cols: 
     term.flush()
 }
 
-/// Draw the in-game bottom status line on `row`: FPS docked at the left, keyboard
-/// hints centered. Hint colors: key labels light-gray, separators dark-gray, the
-/// action each key does in white — all quantized to `depth`. Kept clear of the FPS
-/// and never writes the last column (autowrap is off session-wide, but staying in
-/// bounds is belt-and-suspenders against the bottom-row scroll trap).
+/// The "friendly" part of a ROM file name for display: the title before any
+/// parenthesized region/metadata, and without the extension. E.g.
+/// "Super Mario Land 2 - 6 Golden Coins (USA, Europe).gb"
+///   -> "Super Mario Land 2 - 6 Golden Coins".
+fn friendly_rom_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    stem.split('(').next().unwrap_or(&stem).trim().to_string()
+}
+
+/// Truncate to at most `max` chars, appending ".." when cut (ASCII only — this
+/// goes out raw over the CP437 channel, so no Unicode ellipsis).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(2);
+    s.chars().take(keep).collect::<String>() + ".."
+}
+
+/// Draw the in-game bottom status line on `row`: FPS docked at the left, then a
+/// centered message. Normal play shows the key hints (key labels light-gray,
+/// separators dark-gray, actions white); `attract = Some(name)` shows the game's
+/// friendly name + a take-over prompt instead. All quantized to `depth`, kept
+/// clear of the FPS, and never writing the last column (autowrap is off
+/// session-wide, but staying in bounds is belt-and-suspenders against the
+/// bottom-row scroll trap).
 fn draw_status_bar<W: Write + ?Sized>(
     term: &mut W,
     depth: color::ColorDepth,
@@ -244,20 +268,31 @@ fn draw_status_bar<W: Write + ?Sized>(
     width: u16,
     fps: f32,
     fps_color: &str,
+    attract: Option<&str>,
 ) -> io::Result<()> {
     const LIGHT: (u8, u8, u8) = (170, 170, 170); // key labels
     const DARK: (u8, u8, u8) = (85, 85, 85); // separators (incl. the "/")
-    const WHITE: (u8, u8, u8) = (255, 255, 255); // actions / buttons
-    let spans: [(&str, (u8, u8, u8)); 19] = [
-        ("ARROWS", LIGHT), (" - ", DARK), ("D-Pad", WHITE), (" | ", DARK),
-        // Keys light, buttons white, the slash dark like the other separators.
-        ("Z", LIGHT), ("/", DARK), ("X", LIGHT), (" - ", DARK), ("B", WHITE), ("/", DARK), ("A", WHITE), (" | ", DARK),
-        ("ENTER", LIGHT), (" - ", DARK), ("Start", WHITE), (" | ", DARK),
-        ("SPACE", LIGHT), (" - ", DARK), ("Select", WHITE),
-    ];
+    const WHITE: (u8, u8, u8) = (255, 255, 255); // actions / buttons / title
+    let w = width as usize;
 
-    // Clear the whole row to a solid black background first, so the hints always
-    // render on black and never inherit a stray cell color underneath (which can
+    // Build the centered content as (text, color) spans. Attract mode shows the
+    // title (truncated to fit) + a take-over prompt; normal play shows the hints.
+    let title = attract.map(|name| truncate_chars(name, w.saturating_sub(34).max(8)));
+    let content: Vec<(&str, (u8, u8, u8))> = if let Some(t) = title.as_deref() {
+        vec![(t, WHITE), (" - press any key to play", LIGHT)]
+    } else {
+        vec![
+            ("ARROWS", LIGHT), (" - ", DARK), ("D-Pad", WHITE), (" | ", DARK),
+            // Keys light, buttons white, the slash dark like the other separators.
+            ("Z", LIGHT), ("/", DARK), ("X", LIGHT), (" - ", DARK), ("B", WHITE), ("/", DARK), ("A", WHITE), (" | ", DARK),
+            ("ENTER", LIGHT), (" - ", DARK), ("Start", WHITE), (" | ", DARK),
+            ("SPACE", LIGHT), (" - ", DARK), ("Select", WHITE), (" | ", DARK),
+            ("Q", LIGHT), (" - ", DARK), ("Quit", WHITE),
+        ]
+    };
+
+    // Clear the whole row to a solid black background first, so the content always
+    // renders on black and never inherits a stray cell color underneath (which can
     // make even white text look muddy). `\x1b[K` fills to end-of-line with the
     // active bg; autowrap is off session-wide so this can't scroll the last row.
     emit!(term, MoveTo(0, row))?;
@@ -265,15 +300,14 @@ fn draw_status_bar<W: Write + ?Sized>(
     // FPS at the left (fg only; the black bg from above stays active). Fixed width.
     write!(term, "{}FPS {:>2.0}", fps_color, fps)?;
 
-    // Center the hints, but never under the FPS, and never onto the last column
-    // (last drawn column must be <= width-2). Skip them if they don't fit.
-    let hint_len: usize = spans.iter().map(|(t, _)| t.len()).sum();
-    let w = width as usize;
-    if w > hint_len {
-        let start = ((w - hint_len) / 2).max(8);
-        if start + hint_len <= w.saturating_sub(1) {
+    // Center it, but never under the FPS, and never onto the last column (last
+    // drawn column must be <= width-2). Skip it if it doesn't fit.
+    let content_len: usize = content.iter().map(|(t, _)| t.chars().count()).sum();
+    if w > content_len {
+        let start = ((w - content_len) / 2).max(8);
+        if start + content_len <= w.saturating_sub(1) {
             emit!(term, MoveTo(start as u16, row))?;
-            for (t, (r, g, b)) in spans {
+            for &(t, (r, g, b)) in &content {
                 write!(term, "\x1b[{}m{}", color::fg_sgr(depth, r, g, b), t)?;
             }
         }
@@ -350,6 +384,7 @@ fn main() -> io::Result<()> {
     let ini = config::load_door_ini();
     // Capture before `ini` is partially moved (roms) below.
     let apc_tuning = ini.apc_tuning();
+    let attract_cfg = ini.attract_cfg();
 
     // The released door build has no local audio device, so --mute is effectively
     // always on; it's still honored for `localaudio` builds and back-compat.
@@ -443,6 +478,7 @@ fn main() -> io::Result<()> {
         apc_tuning,
         color_default,
         dmg_default,
+        attract_cfg,
     );
 
     // Restore the screen no matter how the session ended; Term drop restores raw.
@@ -473,6 +509,7 @@ fn run_session(
     apc_tuning: config::ApcTuning,
     color_default: ColorSetting,
     dmg_default: DmgPalette,
+    attract_cfg: config::AttractCfg,
 ) -> io::Result<()> {
     if let Some(rom) = positional_rom {
         let mode = cli_mode.unwrap_or(RenderMode::Ascii);
@@ -481,8 +518,9 @@ fn run_session(
         return run_game(
             term, input, &Path::new(&rom).to_path_buf(), mode,
             !force_mute, ansi_music_flag, false, user_id, render_fps, apc_tuning,
-            color_default, dmg_default,
-        );
+            color_default, dmg_default, false, 0,
+        )
+        .map(|_| ());
     }
 
     // Startup splash (once): the lameboy_splash.bin graphic, dismissed by any key
@@ -496,9 +534,33 @@ fn run_session(
     // size, captured before we resized, so we can restore it when the door exits.
     // Persists across the menu↔game cycle so a game keeps the bigger screen.
     let mut screen_orig: Option<(u16, u16)> = None;
+    // Attract mode: after an attract game ends on its own (no takeover), the next
+    // menu is a short pause before the next random game; otherwise a normal entry.
+    let mut attract_pause = false;
+    // When the caller takes over an attract game, the next menu opens on that ROM
+    // rather than their last explicitly-launched one.
+    let mut select_rom: Option<std::path::PathBuf> = None;
     loop {
-        match show_menu(term, input, user_id, roms_override, animate, &mut screen_orig, color_default, dmg_default)? {
+        // Attract thresholds for this menu entry: (first, subsequent). A pause
+        // uses the short menu interval until the caller engages, then the full
+        // idle interval. None disables attract mode.
+        let attract = if attract_cfg.enabled {
+            let idle = Duration::from_secs(attract_cfg.idle_secs);
+            let first = if attract_pause {
+                Duration::from_secs(attract_cfg.menu_secs)
+            } else {
+                idle
+            };
+            Some((first, idle))
+        } else {
+            None
+        };
+        match show_menu(
+            term, input, user_id, roms_override, animate, &mut screen_orig,
+            color_default, dmg_default, attract, select_rom.take(),
+        )? {
             Some(config) => {
+                let attract_launch = config.attract;
                 let mode = cli_mode.unwrap_or(config.render_mode);
                 let want_apc = config.sound == SoundMode::Apc;
                 // Local PCM device (rodio) only for a non-APC, non-Off mode when
@@ -507,11 +569,17 @@ fn run_session(
                 let audio_enabled =
                     !force_mute && config.sound != SoundMode::Off && !want_apc;
                 let music_enabled = ansi_music_flag && config.sound == SoundMode::Ansi;
-                run_game(
+                let intervened = run_game(
                     term, input, &config.rom_path, mode, audio_enabled,
                     music_enabled, want_apc, user_id, render_fps, apc_tuning,
-                    config.color, config.dmg_palette,
+                    config.color, config.dmg_palette, attract_launch, attract_cfg.game_secs,
                 )?;
+                // An attract game that ran its full time (no takeover) queues the
+                // next one after a short menu pause; anything else is a normal
+                // return to the menu with the full idle countdown.
+                attract_pause = attract_launch && !intervened;
+                // Taking over an attract game: open the next menu on that ROM.
+                select_rom = (attract_launch && intervened).then(|| config.rom_path.clone());
                 animate = false;
             }
             None => break,
@@ -540,7 +608,13 @@ fn run_game(
     apc_tuning: config::ApcTuning,
     color_setting: ColorSetting,
     dmg_palette: DmgPalette,
-) -> io::Result<()> {
+    // Attract mode: run for at most `attract_game_secs`, and treat any key as the
+    // caller taking over. Returns whether the caller intervened (pressed a key);
+    // false means the attract timer elapsed. Non-attract launches always return
+    // true (the caller quit with Esc/Q).
+    attract: bool,
+    attract_game_secs: u64,
+) -> io::Result<bool> {
     let rom = std::fs::read(rom_path).expect("Failed to read ROM file");
 
     let mut gameboy =
@@ -690,6 +764,14 @@ fn run_game(
     let mut resync_timer = Instant::now();
 
     let mut running = true;
+    // Attract mode: play for a limited time, but any key "takes over" — the game
+    // keeps running as a normal session (no timer, hints return, saves enabled).
+    // `attract_active` tracks the current mode; `intervened` records a takeover.
+    let mut attract_active = attract;
+    let mut attract_deadline =
+        attract.then(|| Instant::now() + Duration::from_secs(attract_game_secs));
+    let friendly = friendly_rom_name(rom_path);
+    let mut intervened = false;
     // Track when each button was last seen, to release it on timeout.
     let mut button_last_seen: [Option<Instant>; BUTTON_COUNT] = [None; BUTTON_COUNT];
     // Buttons the terminal drives via real key edges. Once a button arrives as an
@@ -699,6 +781,18 @@ fn run_game(
     // No key-up events arrive over a BBS connection, so buttons release by
     // timeout — long enough to span auto-repeat gaps (~150ms).
     let button_timeout = Duration::from_millis(150);
+
+    // Drain input buffered before this game began — physical-key edges that piled
+    // up while the menu was open (the menu never consumes edges) or a prior game's
+    // trailing key-ups. Otherwise the first frame replays them, and in attract mode
+    // any stray edge would trigger an immediate, wrong "takeover". Briefly loop so
+    // bytes still trickling in after the mode-enable also get cleared.
+    let drain_until = Instant::now() + Duration::from_millis(40);
+    while Instant::now() < drain_until {
+        let _ = input.poll(term)?;
+        let _ = input.take_key_edges();
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     while running {
         // Release any button not seen within the timeout.
@@ -724,6 +818,23 @@ fn run_game(
         // no timeout); otherwise the translated-key path with the timeout above.
         let keys = input.poll(term)?;
         let edges = if edge_input { input.take_key_edges() } else { Vec::new() };
+        // Attract takeover: any real input (translated key or physical edge — probe
+        // replies never surface here) hands the caller the controls. Stay in the
+        // game (keep running), drop the timer, switch the status line back to the
+        // hints, and consume this input so the wake key itself doesn't act or quit.
+        if attract_active && (!keys.is_empty() || !edges.is_empty()) {
+            attract_active = false;
+            attract_deadline = None;
+            intervened = true;
+            redraw_status = true;
+            continue;
+        }
+        // Attract time limit reached with no takeover: end the demo.
+        if let Some(deadline) = attract_deadline {
+            if Instant::now() >= deadline {
+                running = false;
+            }
+        }
         // Enhanced key edges (CtermPhysical, and kitty CSI-u / kitty-form arrows):
         // exact press/release and simultaneous keys. Empty when the terminal
         // isn't sending them, so this is a no-op then.
@@ -905,8 +1016,9 @@ fn run_game(
                     fps_timer = Instant::now();
                 }
                 if fps_tick || redraw_status {
+                    let status = attract_active.then_some(friendly.as_str());
                     draw_status_bar(
-                        &mut *term, depth, renderer.fps_row(), last_size.0, last_fps, &fps_color,
+                        &mut *term, depth, renderer.fps_row(), last_size.0, last_fps, &fps_color, status,
                     )?;
                     redraw_status = false;
                 }
@@ -944,19 +1056,38 @@ fn run_game(
         KeyboardMode::Legacy => {}
     }
 
-    // Save game on exit
-    match save_game(&gameboy, rom_path, user_id) {
-        Ok(true) => println!("Game saved to: {}", get_save_path(rom_path, user_id).display()),
-        Ok(false) => {} // Game doesn't support saves
-        Err(e) => eprintln!("Failed to save game: {}", e),
+    // Save on exit, unless this was a pure attract demo that ran its timer out: a
+    // game the caller never chose or took over shouldn't touch their saves. A
+    // taken-over game (intervened) saves like any normal session.
+    if !attract || intervened {
+        match save_game(&gameboy, rom_path, user_id) {
+            Ok(true) => println!("Game saved to: {}", get_save_path(rom_path, user_id).display()),
+            Ok(false) => {} // Game doesn't support saves
+            Err(e) => eprintln!("Failed to save game: {}", e),
+        }
     }
 
-    Ok(())
+    Ok(intervened)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn friendly_rom_name_strips_region_and_ext() {
+        let f = |s: &str| friendly_rom_name(Path::new(s));
+        assert_eq!(f("Super Mario Land 2 - 6 Golden Coins (USA, Europe).gb"), "Super Mario Land 2 - 6 Golden Coins");
+        assert_eq!(f("Tetris (World) (Rev A).gb"), "Tetris");
+        assert_eq!(f("/roms/1942 (USA, Europe).gbc"), "1942");
+        assert_eq!(f("Kirby.gbc"), "Kirby"); // no region -> whole stem
+    }
+
+    #[test]
+    fn truncate_chars_appends_dots_when_cut() {
+        assert_eq!(truncate_chars("Hello", 10), "Hello");
+        assert_eq!(truncate_chars("HelloWorld", 7), "Hello..");
+    }
 
     #[test]
     fn linkpace_keeps_up_within_2x_budget() {
