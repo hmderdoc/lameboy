@@ -572,6 +572,10 @@ fn run_game(
     let mut running = true;
     // Track when each button was last seen, to release it on timeout.
     let mut button_last_seen: [Option<Instant>; BUTTON_COUNT] = [None; BUTTON_COUNT];
+    // Buttons the terminal drives via real key edges. Once a button arrives as an
+    // edge we ignore its translated "keypress" duplicate, so an iTerm sending both
+    // a CSI-u event and a normal key doesn't double-fire (short jump + long jump).
+    let mut edge_driven: [bool; BUTTON_COUNT] = [false; BUTTON_COUNT];
     // No key-up events arrive over a BBS connection, so buttons release by
     // timeout — long enough to span auto-repeat gaps (~150ms).
     let button_timeout = Duration::from_millis(150);
@@ -599,34 +603,45 @@ fn run_game(
         // are driven by real key edges (exact press/release, simultaneous keys,
         // no timeout); otherwise the translated-key path with the timeout above.
         let keys = input.poll(term)?;
-        if edge_input {
-            let _ = keys; // translated input is suppressed/replaced in edge modes
-            for edge in input.take_key_edges() {
-                if let Some(button) = evdev_to_button(edge.code) {
-                    if edge.pressed {
-                        gameboy.press_button(button);
-                    } else {
-                        gameboy.release_button(button);
-                    }
-                } else if edge.pressed && (edge.code == EVDEV_ESC || edge.code == EVDEV_Q) {
-                    running = false;
+        let edges = if edge_input { input.take_key_edges() } else { Vec::new() };
+        // Enhanced key edges (CtermPhysical, and kitty CSI-u / kitty-form arrows):
+        // exact press/release and simultaneous keys. Empty when the terminal
+        // isn't sending them, so this is a no-op then.
+        for edge in &edges {
+            if let Some(button) = evdev_to_button(edge.code) {
+                edge_driven[button_index(button)] = true;
+                if edge.pressed {
+                    gameboy.press_button(button);
+                } else {
+                    gameboy.release_button(button);
                 }
+            } else if edge.pressed && (edge.code == EVDEV_ESC || edge.code == EVDEV_Q) {
+                running = false;
             }
-        } else {
-            for key in keys {
-                match key {
-                    Key::Esc | Key::Char('q') | Key::Char('Q') => {
-                        running = false;
-                        break;
-                    }
-                    k => {
-                        if let Some(button) = map_key_to_button(k) {
-                            let idx = button_index(button);
-                            let is_new = button_last_seen[idx].is_none();
-                            button_last_seen[idx] = Some(Instant::now());
-                            if is_new {
-                                gameboy.press_button(button);
-                            }
+        }
+        // Translated keys — the universal path, identical to the menu's. When an
+        // enhanced mode fully owns input (SyncTERM suppresses translated via =2h,
+        // a live kitty terminal sends CSI-u), `keys` is empty so there's no double
+        // input; otherwise (e.g. a proxy delivering only normal keys) this is what
+        // keeps the game playable, with the button-release timeout above.
+        for key in keys {
+            match key {
+                Key::Esc | Key::Char('q') | Key::Char('Q') => {
+                    running = false;
+                    break;
+                }
+                k => {
+                    if let Some(button) = map_key_to_button(k) {
+                        let idx = button_index(button);
+                        // This button is driven by precise edges — drop the
+                        // translated duplicate so it doesn't double-fire.
+                        if edge_driven[idx] {
+                            continue;
+                        }
+                        let is_new = button_last_seen[idx].is_none();
+                        button_last_seen[idx] = Some(Instant::now());
+                        if is_new {
+                            gameboy.press_button(button);
                         }
                     }
                 }

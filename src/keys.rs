@@ -236,8 +236,13 @@ impl KeyDecoder {
             State::Csi => {
                 if (0x40..=0x7e).contains(&b) {
                     match b {
-                        b'A' | b'B' | b'C' | b'D' if self.kitty_active => {
-                            // Kitty arrow event (`CSI 1 ; mods:event A..D`).
+                        b'A' | b'B' | b'C' | b'D'
+                            if self.kitty_active && self.csi.contains(':') =>
+                        {
+                            // A kitty arrow event carries an event-type after a
+                            // colon (e.g. `1;1:3 B`). A bare `CSI A..D` is just a
+                            // normal arrow — fall through to a translated key so
+                            // it isn't lost as a press-only (stuck) edge.
                             self.push_kitty_arrow(b);
                         }
                         b'A' => out.push(Key::Up),
@@ -488,6 +493,39 @@ mod tests {
     }
 
     #[test]
+    fn cursor_report_survives_interleaved_capability_replies() {
+        // A real SyncTERM answers the folded probe burst as one chunk: CTDA
+        // (CSI<...c), the CPR (CSI row;colR), then Primary DA (CSI?...c). The CPR
+        // must still be captured and no probe reply may leak as a keystroke.
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1b[<0;8c\x1b[24;80R\x1b[?62c"), []); // nothing keyed
+        assert_eq!(d.take_cursor(), Some((24, 80)), "CPR captured amid caps");
+        assert_eq!(d.take_cursor(), None);
+        // The capability replies in the same burst still resolved the protocol.
+        assert_eq!(d.keyboard_mode(), KeyboardMode::CtermPhysical);
+        assert!(d.caps_resolved(), "DA1 barrier seen");
+        // And no stray key edges were produced by the c/R/c sequence.
+        assert!(d.take_key_edges().is_empty());
+
+        // Order-independence: CPR last, after both caps replies.
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1b[<0;8c\x1b[?62;1;6c\x1b[24;80R"), []);
+        assert_eq!(d.take_cursor(), Some((24, 80)));
+    }
+
+    #[test]
+    fn cterm_single_key_press_then_release_decodes_to_evdev_44_edges() {
+        // A terminal sending proper CTerm physical key reports for one key (Z):
+        // press `CSI = 44 K`, then release `CSI = 44 k`. Each drains as exactly
+        // one edge with the right evdev code and direction, and no Key output.
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1b[=44K"), []); // press, no translated key
+        assert_eq!(d.take_key_edges(), vec![KeyEdge { code: 44, pressed: true }]);
+        assert_eq!(d.feed(b"\x1b[=44k"), []); // release, no translated key
+        assert_eq!(d.take_key_edges(), vec![KeyEdge { code: 44, pressed: false }]);
+    }
+
+    #[test]
     fn physical_key_reports_decode_to_edges_not_keys() {
         let mut d = KeyDecoder::new();
         // Two keys pressed together, then one released — no Key output.
@@ -503,6 +541,31 @@ mod tests {
         d.feed(b"\x1b[=7;2;0n");
         assert!(d.take_key_edges().is_empty());
         assert_eq!(d.take_audio_drain(), Some(2));
+    }
+
+    #[test]
+    fn iterm_kitty_session_flow_resolves_and_decodes() {
+        // Mock a realistic iTerm-over-the-wire session: the probe replies it
+        // sends back, then (after the door enables kitty) movement+jump events.
+        let mut d = KeyDecoder::new();
+        // iTerm ignores the CTerm CTDA query, answers the kitty query, then DA1.
+        d.feed(b"\x1b[?0u");           // kitty supported
+        d.feed(b"\x1b[?62;4;6;22c");   // Primary DA (barrier); note the 22 contains no bare "8"
+        assert_eq!(d.keyboard_mode(), KeyboardMode::Kitty, "iTerm should resolve to Kitty");
+        assert!(d.caps_resolved());
+        // Door enables kitty. Letters arrive as CSI-u -> edges. A *bare* arrow is
+        // a normal key (translated), not a stuck press-only edge; only a kitty
+        // arrow event (event-type after a colon) becomes an edge.
+        d.set_kitty_active(true);
+        assert_eq!(d.feed(b"\x1b[122u"), []);       // z press -> edge
+        assert_eq!(d.feed(b"\x1b[122;1:3u"), []);   // z release -> edge
+        assert_eq!(d.feed(b"\x1b[C"), [Key::Right]); // bare arrow -> translated
+        assert_eq!(d.feed(b"\x1b[1;1:3C"), []);     // kitty arrow event -> edge
+        assert_eq!(d.take_key_edges(), vec![
+            KeyEdge { code: 44, pressed: true },    // z down (A)
+            KeyEdge { code: 44, pressed: false },   // z up
+            KeyEdge { code: 106, pressed: false },  // right release (kitty-form)
+        ]);
     }
 
     #[test]
