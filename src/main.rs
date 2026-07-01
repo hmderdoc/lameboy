@@ -4,6 +4,7 @@ mod ansi_music;
 mod apc_audio;
 #[cfg(feature = "localaudio")]
 mod audio;
+mod color;
 mod config;
 mod door32;
 mod term;
@@ -14,6 +15,7 @@ mod input;
 mod menu;
 mod renderer;
 mod save;
+mod splash;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -30,7 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "localaudio")]
 use audio::{AudioBuffer, GameboyAudioSource};
-use framebuffer::{FrameBuffer, GB_HEIGHT, GB_WIDTH};
+use color::ColorSetting;
+use framebuffer::{DmgPalette, FrameBuffer, GB_HEIGHT, GB_WIDTH};
 use input::{evdev_to_button, map_key_to_button, EVDEV_ESC, EVDEV_Q};
 use keys::{Input, Key, KeyboardMode};
 use menu::{show_menu, SoundMode};
@@ -56,8 +59,8 @@ fn button_index(button: gameboy_core::Button) -> usize {
     }
 }
 
-// Colors
-const FPS_COLOR: &str = "\x1b[38;2;80;200;80m";
+// Colors. The FPS green is quantized to the active depth at emit time (see the
+// overlay in run_game) so it isn't a raw truecolor escape on a lesser terminal.
 const RESET: &str = "\x1b[0m";
 
 /// Default transmit frame rate (Hz). The emulator always runs at full Game Boy
@@ -136,6 +139,8 @@ fn print_usage(program: &str) {
     eprintln!("Options:");
     eprintln!("  --ascii       ASCII art mode with brightness characters (default)");
     eprintln!("  --block       Unicode block mode with solid half-blocks");
+    eprintln!("  --color MODE  Output color depth: auto (default) | truecolor | 256 | 16");
+    eprintln!("  --dmg PAL     Non-color (DMG) game palette: gray (default) | green");
     eprintln!("  --mute        Disable audio output");
     eprintln!("  --ansi-music  Approximate music via ANSI/terminal-beeper tones");
     eprintln!();
@@ -166,7 +171,12 @@ pub(crate) fn send_size_probe<W: Write + ?Sized>(term: &mut W, with_caps: bool) 
     emit!(term, MoveTo(9998, 9998))?;
     term.write_all(b"\x1b[6n")?;
     if with_caps {
-        term.write_all(b"\x1b[<c\x1b[?u\x1b[c")?;
+        // Keyboard-capability queries, plus the DECRQSS color probe: set an odd
+        // 24-bit fg, ask the terminal to read the active SGR back (`ESC P $ q m
+        // ESC \`), then reset. Nothing is drawn. A truecolor terminal echoes
+        // `38;2;...`; one that only does 256 quantizes it to `38;5;N` (see
+        // `parse_color_readback`). The Primary DA (`ESC [ c`) closes the burst.
+        term.write_all(b"\x1b[<c\x1b[?u\x1b[38;2;1;2;3m\x1bP$qm\x1b\\\x1b[0m\x1b[c")?;
     }
     term.flush()
 }
@@ -219,6 +229,56 @@ fn disable_kitty_keys<W: Write + ?Sized>(term: &mut W) -> io::Result<()> {
 /// ignore it harmlessly (their `CSI ... t` is 24-bit colour and needs 4 params).
 pub(crate) fn resize_terminal<W: Write + ?Sized>(term: &mut W, rows: u16, cols: u16) -> io::Result<()> {
     write!(term, "\x1b[8;{};{}t", rows, cols)?;
+    term.flush()
+}
+
+/// Draw the in-game bottom status line on `row`: FPS docked at the left, keyboard
+/// hints centered. Hint colors: key labels light-gray, separators dark-gray, the
+/// action each key does in white — all quantized to `depth`. Kept clear of the FPS
+/// and never writes the last column (autowrap is off session-wide, but staying in
+/// bounds is belt-and-suspenders against the bottom-row scroll trap).
+fn draw_status_bar<W: Write + ?Sized>(
+    term: &mut W,
+    depth: color::ColorDepth,
+    row: u16,
+    width: u16,
+    fps: f32,
+    fps_color: &str,
+) -> io::Result<()> {
+    const LIGHT: (u8, u8, u8) = (170, 170, 170); // key labels
+    const DARK: (u8, u8, u8) = (85, 85, 85); // separators (incl. the "/")
+    const WHITE: (u8, u8, u8) = (255, 255, 255); // actions / buttons
+    let spans: [(&str, (u8, u8, u8)); 19] = [
+        ("ARROWS", LIGHT), (" - ", DARK), ("D-Pad", WHITE), (" | ", DARK),
+        // Keys light, buttons white, the slash dark like the other separators.
+        ("Z", LIGHT), ("/", DARK), ("X", LIGHT), (" - ", DARK), ("B", WHITE), ("/", DARK), ("A", WHITE), (" | ", DARK),
+        ("ENTER", LIGHT), (" - ", DARK), ("Start", WHITE), (" | ", DARK),
+        ("SPACE", LIGHT), (" - ", DARK), ("Select", WHITE),
+    ];
+
+    // Clear the whole row to a solid black background first, so the hints always
+    // render on black and never inherit a stray cell color underneath (which can
+    // make even white text look muddy). `\x1b[K` fills to end-of-line with the
+    // active bg; autowrap is off session-wide so this can't scroll the last row.
+    emit!(term, MoveTo(0, row))?;
+    term.write_all(b"\x1b[40m\x1b[K")?;
+    // FPS at the left (fg only; the black bg from above stays active). Fixed width.
+    write!(term, "{}FPS {:>2.0}", fps_color, fps)?;
+
+    // Center the hints, but never under the FPS, and never onto the last column
+    // (last drawn column must be <= width-2). Skip them if they don't fit.
+    let hint_len: usize = spans.iter().map(|(t, _)| t.len()).sum();
+    let w = width as usize;
+    if w > hint_len {
+        let start = ((w - hint_len) / 2).max(8);
+        if start + hint_len <= w.saturating_sub(1) {
+            emit!(term, MoveTo(start as u16, row))?;
+            for (t, (r, g, b)) in spans {
+                write!(term, "\x1b[{}m{}", color::fg_sgr(depth, r, g, b), t)?;
+            }
+        }
+    }
+    term.write_all(RESET.as_bytes())?;
     term.flush()
 }
 
@@ -308,6 +368,20 @@ fn main() -> io::Result<()> {
     };
     let render_fps = parse_fps(&args).or(ini.fps).unwrap_or(DEFAULT_RENDER_FPS);
 
+    // Color depth default: `--color <auto|truecolor|256|16>` (test/sysop knob),
+    // else the `color =` sysop ini default, else Auto (probe + truecolor default).
+    // A caller's saved per-user pref, chosen in the menu, overrides this.
+    let color_default = parse_value(&args, "--color")
+        .and_then(|s| ColorSetting::parse(&s))
+        .or_else(|| ini.color.as_deref().and_then(ColorSetting::parse))
+        .unwrap_or(ColorSetting::Auto);
+
+    // DMG (non-color game) palette default: `--dmg <gray|green>` (test/sysop knob).
+    // A caller's saved per-user pref, chosen in the menu, overrides this.
+    let dmg_default = parse_value(&args, "--dmg")
+        .and_then(|s| DmgPalette::parse(&s))
+        .unwrap_or_default();
+
     // DOOR32.SYS dropfile: on a BBS that doesn't pass the connection via stdio
     // (e.g. EleBBS/Mystic/Synchronet Win32), it names the inherited socket and
     // the user. The per-user key is the explicit --user, else the dropfile's
@@ -331,7 +405,7 @@ fn main() -> io::Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--user" || a == "--fps" || a == "--dropfile" || a == "--roms" {
+            if matches!(a.as_str(), "--user" | "--fps" | "--dropfile" | "--roms" | "--color" | "--dmg") {
                 skip_next = true;
                 continue;
             }
@@ -349,6 +423,11 @@ fn main() -> io::Result<()> {
     let mut term = term::open(door.as_ref())?;
     let mut input = Input::new();
     emit!(term, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
+    // Autowrap off for the whole session: painting the bottom-right cell (a
+    // full-screen splash, or a status line on the last row) then can't scroll the
+    // screen. Everything positions with absolute cursor moves, so nothing relies
+    // on wrap. Restored on exit.
+    term.write_all(b"\x1b[?7l")?;
     term.flush()?;
 
     let result = run_session(
@@ -362,6 +441,8 @@ fn main() -> io::Result<()> {
         roms_override.as_deref(),
         render_fps,
         apc_tuning,
+        color_default,
+        dmg_default,
     );
 
     // Restore the screen no matter how the session ended; Term drop restores raw.
@@ -370,6 +451,7 @@ fn main() -> io::Result<()> {
     // caller's BBS keyboard would stay suppressed after the door returns.
     let _ = disable_physical_keys(&mut *term);
     let _ = disable_kitty_keys(&mut *term);
+    let _ = term.write_all(b"\x1b[?7h"); // restore autowrap
     let _ = emit!(term, Show, LeaveAlternateScreen);
     let _ = term.flush();
     result
@@ -389,22 +471,33 @@ fn run_session(
     roms_override: Option<&str>,
     render_fps: f64,
     apc_tuning: config::ApcTuning,
+    color_default: ColorSetting,
+    dmg_default: DmgPalette,
 ) -> io::Result<()> {
     if let Some(rom) = positional_rom {
         let mode = cli_mode.unwrap_or(RenderMode::Ascii);
+        // A direct ROM launch has no menu, so take the color/palette defaults from
+        // the CLI/ini. run_game resolves the depth after the probe answers.
         return run_game(
             term, input, &Path::new(&rom).to_path_buf(), mode,
             !force_mute, ansi_music_flag, false, user_id, render_fps, apc_tuning,
+            color_default, dmg_default,
         );
     }
 
-    let mut animate = true;
+    // Startup splash (once): the lameboy_splash.bin graphic, dismissed by any key
+    // or after 10s. It also front-loads size/keyboard/color detection so the menu
+    // opens already at the caller's real size and color depth. With no splash
+    // graphic present, fall back to the built-in wordmark intro animation.
+    let splashed = splash::show_splash(term, input, color_default)?;
+
+    let mut animate = !splashed;
     // Set by the menu's "Best" screen-size mode: the caller's original terminal
     // size, captured before we resized, so we can restore it when the door exits.
     // Persists across the menu↔game cycle so a game keeps the bigger screen.
     let mut screen_orig: Option<(u16, u16)> = None;
     loop {
-        match show_menu(term, input, user_id, roms_override, animate, &mut screen_orig)? {
+        match show_menu(term, input, user_id, roms_override, animate, &mut screen_orig, color_default, dmg_default)? {
             Some(config) => {
                 let mode = cli_mode.unwrap_or(config.render_mode);
                 let want_apc = config.sound == SoundMode::Apc;
@@ -417,6 +510,7 @@ fn run_session(
                 run_game(
                     term, input, &config.rom_path, mode, audio_enabled,
                     music_enabled, want_apc, user_id, render_fps, apc_tuning,
+                    config.color, config.dmg_palette,
                 )?;
                 animate = false;
             }
@@ -444,6 +538,8 @@ fn run_game(
     user_id: Option<&str>,
     render_fps: f64,
     apc_tuning: config::ApcTuning,
+    color_setting: ColorSetting,
+    dmg_palette: DmgPalette,
 ) -> io::Result<()> {
     let rom = std::fs::read(rom_path).expect("Failed to read ROM file");
 
@@ -488,15 +584,14 @@ fn run_game(
     emit!(term, Clear(ClearType::All))?;
 
     let mut framebuffer = FrameBuffer::new(GB_WIDTH, GB_HEIGHT);
-    let config = RenderConfig { mode };
-    let mut renderer = Renderer::new(config);
-    renderer.update_dimensions(80, 24);
     let _ = send_size_probe(&mut *term, !input.caps_resolved());
 
     // Resolve the keyboard protocol and switch on the enhanced mode if any:
     // CtermPhysical (SyncTERM) or Kitty (modern terminals) both yield real
     // key-down/up edges and simultaneous keys; the decoder normalises kitty to
-    // the same evdev codes, so the in-game edge path is shared.
+    // the same evdev codes, so the in-game edge path is shared. The same probe
+    // burst also carries the color probe, so its reply is in by the time we
+    // resolve the depth below.
     let kb_mode = detect_keyboard(&mut *term, input)?;
     let edge_input = matches!(kb_mode, KeyboardMode::CtermPhysical | KeyboardMode::Kitty);
     match kb_mode {
@@ -509,6 +604,17 @@ fn run_game(
         }
         KeyboardMode::Legacy => {}
     }
+
+    // Resolve the output color depth now that the probe has (or hasn't) answered,
+    // then build the renderer. Auto stays truecolor -> emits 256 for the game
+    // (the game's top tier); an explicit 16 takes the classic-ANSI path.
+    let depth = color_setting.resolve(input.color_probe());
+    // Apply the DMG palette now that the depth is known — green is forced to gray
+    // in 16-color (its greens don't quantize well; grayscale hits the ANSI grays).
+    framebuffer.set_dmg_palette(dmg_palette.resolved_for(depth));
+    let fps_color = format!("\x1b[{}m", color::fg_sgr(depth, 80, 200, 80));
+    let mut renderer = Renderer::new(RenderConfig { mode, depth });
+    renderer.update_dimensions(80, 24);
 
     // Use precise floating-point duration for accurate 60 FPS (16.667ms, not 16ms).
     // This paces the *emulator* — the game always runs at full Game Boy speed.
@@ -537,6 +643,10 @@ fn run_game(
     // FPS tracking (counts frames actually transmitted)
     let mut frame_count = 0u32;
     let mut fps_timer = Instant::now();
+    let mut last_fps = 0.0f32;
+    // Redraw the bottom status bar (FPS + key hints) on the next frame — set on
+    // the first frame and after a resize (both of which clear the whole screen).
+    let mut redraw_status = true;
 
     // Live-resize polling: a door connection delivers no SIGWINCH/resize events,
     // so we periodically probe the terminal for its size (see send_size_probe).
@@ -676,6 +786,7 @@ fn run_game(
             if size.0 > 0 && size.1 > 0 && size != last_size {
                 last_size = size;
                 renderer.update_dimensions(size.0, size.1);
+                redraw_status = true; // the resize cleared the old status bar
             }
         }
         // Re-probe ~1/sec, but not while the link is saturated (its blocking
@@ -781,18 +892,23 @@ fn run_game(
                 ansi.update(gameboy.get_sound(), &mut *term);
                 renderer.render(&framebuffer, &mut *term)?;
 
-                // FPS overlay (transmitted frame rate), at most once/sec. APC
-                // audio diagnostics go to the log only (see emit below), not the
-                // screen, to keep the status bar from overflowing.
+                // Bottom status bar: FPS (transmitted rate, refreshed once/sec)
+                // docked left, keyboard hints centered. Redrawn on the FPS tick and
+                // right after a resize (which cleared the old bar). APC audio
+                // diagnostics go to the log only, not the screen.
                 frame_count += 1;
                 let fps_elapsed = fps_timer.elapsed();
-                if fps_elapsed >= Duration::from_secs(1) {
-                    let fps = frame_count as f32 / fps_elapsed.as_secs_f32();
+                let fps_tick = fps_elapsed >= Duration::from_secs(1);
+                if fps_tick {
+                    last_fps = frame_count as f32 / fps_elapsed.as_secs_f32();
                     frame_count = 0;
                     fps_timer = Instant::now();
-                    emit!(term, MoveTo(0, renderer.fps_row()))?;
-                    write!(term, "{}FPS: {:5.1}  {}", FPS_COLOR, fps, RESET)?;
-                    term.flush()?;
+                }
+                if fps_tick || redraw_status {
+                    draw_status_bar(
+                        &mut *term, depth, renderer.fps_row(), last_size.0, last_fps, &fps_color,
+                    )?;
+                    redraw_status = false;
                 }
 
                 // Charge the write+flush time to the pacer: if it overran the

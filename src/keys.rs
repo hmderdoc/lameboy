@@ -9,6 +9,8 @@
 //! There are no key-up events over a socket; callers treat every key as a press
 //! and rely on the existing button-release timeout.
 
+use crate::color::ColorDepth;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
     Char(char),
@@ -40,11 +42,17 @@ enum State {
     Esc,    // saw ESC, awaiting continuation (or idle -> Key::Esc)
     Csi,    // saw ESC [ , accumulating to a final byte
     Ss3,    // saw ESC O , awaiting one byte
+    Dcs,    // saw ESC P , accumulating a device-control string (DECRQSS reply)
+    DcsEsc, // inside DCS, saw ESC , awaiting the `\` of the ST terminator
     Iac,    // saw 0xFF
     IacOpt, // saw IAC + WILL/WONT/DO/DONT, awaiting option byte
     IacSub, // inside SB ... , awaiting IAC
     IacSubIac, // inside SB, saw IAC, awaiting SE
 }
+
+/// Longest DCS body we buffer before giving up (a malformed stream with no ST
+/// terminator can't be allowed to grow unbounded).
+const MAX_DCS_LEN: usize = 64;
 
 /// Which keyboard-input protocol the connected terminal supports, resolved from
 /// the startup capability probes (folded into the size-probe handshake). Selects
@@ -72,12 +80,17 @@ pub struct KeyDecoder {
     state: State,
     cr_seen: bool,             // swallow the LF/NUL that may follow a CR
     csi: String,               // accumulated CSI parameter bytes
+    dcs: String,               // accumulated DCS body (DECRQSS color readback)
     cursor: Option<(u16, u16)>, // last cursor-position report (row, col)
     audio_drain: Option<u8>,   // channel from a `CSI =7;ch;0 n` drain report
     // Keyboard capability flags, set as the probe replies arrive.
     phys_keys: bool,           // CTDA (`CSI < ... c`) advertised value 8
     kitty_keys: bool,          // kitty query reply (`CSI ? flags u`)
     da1_seen: bool,            // Primary DA reply (`CSI ? ... c`) — the probe barrier
+    // Color depth resolved from the DECRQSS probe reply, if the terminal answered:
+    // Some(C256) = it quantized our 24-bit set (downgrade), Some(True) = kept 24-bit.
+    // A stable capability once seen — peeked, not consumed.
+    color_probe: Option<ColorDepth>,
     key_edges: Vec<KeyEdge>,   // physical key press/release edges awaiting the caller
     kitty_active: bool,        // kitty mode enabled: route CSI-u/arrow events to edges
 }
@@ -88,11 +101,13 @@ impl Default for KeyDecoder {
             state: State::Ground,
             cr_seen: false,
             csi: String::new(),
+            dcs: String::new(),
             cursor: None,
             audio_drain: None,
             phys_keys: false,
             kitty_keys: false,
             da1_seen: false,
+            color_probe: None,
             key_edges: Vec::new(),
             kitty_active: false,
         }
@@ -114,14 +129,28 @@ impl KeyDecoder {
     }
 
     /// Call when a poll returned no bytes: resolves a lone trailing ESC into the
-    /// Esc key (it wasn't the start of an escape sequence after all).
+    /// Esc key (it wasn't the start of an escape sequence after all). Also drops a
+    /// dangling DCS whose ST terminator never arrived so we can't wedge there
+    /// (a real DECRQSS reply arrives whole, so this only fires on a malformed one).
     pub fn idle(&mut self) -> Option<Key> {
-        if self.state == State::Esc {
-            self.state = State::Ground;
-            Some(Key::Esc)
-        } else {
-            None
+        match self.state {
+            State::Esc => {
+                self.state = State::Ground;
+                Some(Key::Esc)
+            }
+            State::Dcs | State::DcsEsc => {
+                self.dcs.clear();
+                self.state = State::Ground;
+                None
+            }
+            _ => None,
         }
+    }
+
+    /// The color depth resolved from the DECRQSS probe reply, if the terminal
+    /// answered. Sticky (a stable capability): safe to read repeatedly.
+    pub fn color_probe(&self) -> Option<ColorDepth> {
+        self.color_probe
     }
 
     /// Take the most recent cursor-position report (`ESC [ row ; col R`), if the
@@ -203,6 +232,16 @@ impl KeyDecoder {
         self.key_edges.push(KeyEdge { code, pressed: kitty_event(&self.csi) != 3 });
     }
 
+    /// A DCS body completed (ST or BEL). Classify it as a color-probe reply and
+    /// return to ground. The body never surfaces as keystrokes.
+    fn finish_dcs(&mut self) {
+        if let Some(depth) = parse_color_readback(&self.dcs) {
+            self.color_probe = Some(depth);
+        }
+        self.dcs.clear();
+        self.state = State::Ground;
+    }
+
     fn step(&mut self, b: u8, out: &mut Vec<Key>) {
         match self.state {
             State::Iac => {
@@ -228,6 +267,12 @@ impl KeyDecoder {
                     self.state = State::Csi;
                 }
                 b'O' => self.state = State::Ss3,
+                b'P' => {
+                    // DCS introducer: a DECRQSS reply to our color probe. Buffer
+                    // the body; it never surfaces as keys.
+                    self.dcs.clear();
+                    self.state = State::Dcs;
+                }
                 0x1b => out.push(Key::Esc), // previous ESC was lone; stay in Esc for this one
                 _ => {
                     out.push(Key::Esc); // previous ESC was lone
@@ -314,6 +359,30 @@ impl KeyDecoder {
                 }
                 self.state = State::Ground;
             }
+            State::Dcs => {
+                if b == 0x1b {
+                    self.state = State::DcsEsc; // maybe the ST terminator `ESC \`
+                } else if b == 0x07 {
+                    self.finish_dcs(); // some terminals end with BEL
+                } else if self.dcs.len() < MAX_DCS_LEN {
+                    self.dcs.push(b as char);
+                } else {
+                    // Runaway (no terminator): drop it rather than grow forever.
+                    self.dcs.clear();
+                    self.state = State::Ground;
+                }
+            }
+            State::DcsEsc => {
+                // In a DCS, `ESC \` is the string terminator. Anything else means
+                // that ESC wasn't a terminator; finish what we have and reprocess
+                // the byte from ground so a following key isn't swallowed.
+                if b == b'\\' {
+                    self.finish_dcs();
+                } else {
+                    self.finish_dcs();
+                    self.step(b, out);
+                }
+            }
             State::Ground => self.ground(b, out),
         }
     }
@@ -340,6 +409,25 @@ impl KeyDecoder {
             _ => {} // other control bytes: ignored
         }
         self.cr_seen = false;
+    }
+}
+
+/// Classify a DECRQSS SGR reply body (the text between `ESC P` and the ST).
+/// Our color probe set FG to an odd 24-bit value; the reply echoes `38;2;...`
+/// when the terminal preserved 24-bit (truecolor) or `38;5;N` when it quantized
+/// to 256 (some terminals use colon subparams, e.g. `38:2:...`). Only a
+/// DECRQSS-shaped reply (contains `$r`) is trusted; anything else -> None, which
+/// leaves the caller at its truecolor default (conservative, never over-downgrades).
+fn parse_color_readback(body: &str) -> Option<ColorDepth> {
+    if !body.contains("$r") {
+        return None;
+    }
+    if body.contains("38;5") || body.contains("38:5") {
+        Some(ColorDepth::C256)
+    } else if body.contains("38;2") || body.contains("38:2") {
+        Some(ColorDepth::True)
+    } else {
+        None
     }
 }
 
@@ -470,6 +558,12 @@ impl Input {
     /// the capability queries into subsequent size probes.
     pub fn caps_resolved(&self) -> bool {
         self.decoder.caps_resolved()
+    }
+
+    /// Color depth resolved from the DECRQSS probe reply, if the terminal answered
+    /// (sticky; None means it stayed silent -> caller keeps its truecolor default).
+    pub fn color_probe(&self) -> Option<ColorDepth> {
+        self.decoder.color_probe()
     }
 
     /// Drain physical key edges decoded since the last call (edge modes).
@@ -648,6 +742,51 @@ mod tests {
         let mut d = KeyDecoder::new();
         d.feed(b"\x1b[<0;5;6;7c\x1b[?62c");
         assert_eq!(d.keyboard_mode(), KeyboardMode::Legacy);
+    }
+
+    #[test]
+    fn decrqss_color_reply_resolves_depth_without_keying() {
+        // Terminal quantized our 24-bit probe to 256: ESC P 1 $ r 0;38;5;16m ESC \
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1bP1$r0;38;5;16m\x1b\\"), []); // no keys
+        assert_eq!(d.color_probe(), Some(ColorDepth::C256));
+        assert!(d.take_key_edges().is_empty());
+
+        // Terminal preserved 24-bit -> truecolor confirmed (colon subparams too).
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1bP1$r0;38:2::1:2:3m\x1b\\"), []);
+        assert_eq!(d.color_probe(), Some(ColorDepth::True));
+
+        // Silent / non-DECRQSS -> never resolves (caller stays at its default).
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.color_probe(), None);
+        d.feed(b"\x1b[24;80R"); // a stray CPR is not a color reply
+        assert_eq!(d.color_probe(), None);
+    }
+
+    #[test]
+    fn dcs_interleaved_with_probe_replies_keeps_them_all() {
+        // A realistic burst: CTDA, the color DECRQSS reply, CPR, then Primary DA.
+        // Every capability must resolve and nothing may leak as a keystroke.
+        let mut d = KeyDecoder::new();
+        assert_eq!(
+            d.feed(b"\x1b[<0;8c\x1bP1$r0;38;5;9m\x1b\\\x1b[24;80R\x1b[?62c"),
+            []
+        );
+        assert_eq!(d.color_probe(), Some(ColorDepth::C256));
+        assert_eq!(d.take_cursor(), Some((24, 80)));
+        assert_eq!(d.keyboard_mode(), KeyboardMode::CtermPhysical);
+        assert!(d.caps_resolved());
+    }
+
+    #[test]
+    fn malformed_dcs_without_terminator_is_dropped_on_idle() {
+        // A bare `ESC P` with no ST must not wedge the decoder; idle clears it and
+        // a subsequent key decodes normally.
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1bPsome garbage"), []);
+        assert_eq!(d.idle(), None); // dangling DCS dropped
+        assert_eq!(d.feed(b"z"), [Key::Char('z')]);
     }
 
     #[test]

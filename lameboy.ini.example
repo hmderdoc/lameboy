@@ -1,8 +1,8 @@
 ; Lameboy door — sysop defaults.
 ;
 ; Copy to "lameboy.ini" next to the binary and edit. Everything here is
-; optional; a command-line flag (--roms, --fps, --ansi-music) overrides the
-; matching key. Per-call values (the DOOR32 dropfile path and the user id) are
+; optional; a command-line flag (--roms, --fps, --ansi-music, --color) overrides
+; the matching key. Per-call values (the DOOR32 dropfile path and the user id) are
 ; NOT configured here — the BBS supplies those on the command line at launch.
 ;
 ; Lines starting with ; or # are comments.
@@ -17,6 +17,15 @@
 ; Offer ANSI-music sound (the caller still picks Off / ANSI / APC in the menu).
 ; Set false for a silent door / APC-only. Default true.
 ;ansi_music = true
+
+; Default output color depth (the caller can still change it in the menu, and a
+; saved per-user choice wins). One of:
+;   auto      - probe the terminal; truecolor, dropping to 256 if it can't (default)
+;   truecolor - 24-bit color (best on SyncTERM / modern terminals)
+;   256       - xterm 256-color (kinder to slow links)
+;   16        - classic 16-color ANSI (for terminals with no extended color)
+; Auto never picks 16 on its own; set it here (or in the menu) for 16-color boards.
+;color = auto
 
 ; --- APC audio streaming (SyncTERM PCM) -------------------------------------
 ; These tune the real-PCM stream sent to APC-audio terminals. They do nothing

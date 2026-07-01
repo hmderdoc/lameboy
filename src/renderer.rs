@@ -1,3 +1,4 @@
+use crate::color::{self, ColorDepth};
 use crate::framebuffer::{FrameBuffer, GB_HEIGHT, GB_WIDTH};
 use std::io::{self, Write};
 
@@ -39,6 +40,10 @@ const HALF_BLOCK: u8 = 0xDF;
 
 pub struct RenderConfig {
     pub mode: RenderMode,
+    /// Output color depth. `True` and `C256` both emit 256-color here (the game's
+    /// top tier is 256; only the menu goes truecolor); `C16` takes the classic
+    /// ANSI path with ordered dithering.
+    pub depth: ColorDepth,
 }
 
 pub struct Renderer {
@@ -180,16 +185,6 @@ impl Renderer {
         }
     }
 
-    /// Convert RGB to 256-color palette index (6x6x6 color cube: indices 16-231)
-    #[inline]
-    fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
-        // Map 0-255 to 0-5 for each channel, then to color cube index
-        let r6 = (r as u16 * 6 / 256) as u8;
-        let g6 = (g as u16 * 6 / 256) as u8;
-        let b6 = (b as u16 * 6 / 256) as u8;
-        16 + 36 * r6 + 6 * g6 + b6
-    }
-
     #[inline]
     fn write_u8(&mut self, n: u8) {
         if n >= 100 {
@@ -263,6 +258,22 @@ impl Renderer {
         }
     }
 
+    /// Set the classic-ANSI fg/bg pair for a cell. Unlike 256-color mode (fg and
+    /// bg are independent SGRs), the 16-color form resets attributes to manage the
+    /// bold/bright bit, so fg+bg go out together and dedup on the pair.
+    #[inline]
+    fn set_pair_16(&mut self, fg: u8, bg: u8) {
+        if fg != self.last_fg || bg != self.last_bg {
+            self.output_buffer.push(b'\x1b');
+            self.output_buffer.push(b'[');
+            self.output_buffer
+                .extend_from_slice(color::sgr16(fg, bg).as_bytes());
+            self.output_buffer.push(b'm');
+            self.last_fg = fg;
+            self.last_bg = bg;
+        }
+    }
+
     #[inline]
     fn brightness_to_ascii(brightness: u8) -> u8 {
         // Map 0-255 brightness to ASCII char index using integer math
@@ -294,6 +305,7 @@ impl Renderer {
 
         let out_cols = self.out_cols as usize;
         let out_rows = self.out_rows as usize;
+        let is16 = self.config.depth == ColorDepth::C16;
 
         for i in 0..out_rows {
             let row = self.top_pad + i as u16 + 1; // 1-based
@@ -310,12 +322,25 @@ impl Renderer {
                 let top = fb.get_pixel(sx, sy_top);
                 let bottom = fb.get_pixel(sx, sy_bot);
 
-                // Use 256-color palette for shorter escape sequences
-                let fg_color = Self::rgb_to_256(top.r, top.g, top.b);
-                let bg_color = Self::rgb_to_256(bottom.r, bottom.g, bottom.b);
+                // Quantize the two stacked pixels for the active depth. 256/true
+                // use the half-block with independent fg/bg indices; 16 dithers to
+                // the ANSI palette and packs to a fg/bg/glyph (the glyph varies).
+                let (ch, fg_color, bg_color) = if is16 {
+                    let t16 = color::nearest16(top.r, top.g, top.b, j, 2 * i);
+                    let b16 = color::nearest16(bottom.r, bottom.g, bottom.b, j, 2 * i + 1);
+                    // pack_cell16 -> (fg, bg, glyph); the cell key is (ch, fg, bg).
+                    let (fg, bg, glyph) = color::pack_cell16(t16, b16);
+                    (glyph, fg, bg)
+                } else {
+                    (
+                        HALF_BLOCK,
+                        color::xterm256(top.r, top.g, top.b),
+                        color::xterm256(bottom.r, bottom.g, bottom.b),
+                    )
+                };
 
                 let idx = i * out_cols + j;
-                let cell = Cell { ch: HALF_BLOCK, fg: fg_color, bg: bg_color };
+                let cell = Cell { ch, fg: fg_color, bg: bg_color };
                 if self.prev_cells[idx] == cell {
                     drawing = false; // unchanged: skip, breaking any run
                     continue;
@@ -325,9 +350,13 @@ impl Renderer {
                     self.move_to(row, self.left_pad + 1 + j as u16);
                     drawing = true;
                 }
-                self.set_fg_256(fg_color);
-                self.set_bg_256(bg_color);
-                self.output_buffer.push(HALF_BLOCK);
+                if is16 {
+                    self.set_pair_16(fg_color, bg_color);
+                } else {
+                    self.set_fg_256(fg_color);
+                    self.set_bg_256(bg_color);
+                }
+                self.output_buffer.push(ch);
                 self.prev_cells[idx] = cell;
             }
         }
@@ -357,11 +386,16 @@ impl Renderer {
         }
         self.force_repaint = false;
 
-        // The end-of-frame reset clears the background, so re-assert black bg
-        // (256-color index 16) once per frame; it stays active for every cell we
-        // emit below. last_fg sentinel forces the first changed cell to set fg.
+        // Colored glyphs on a black background. 256/true assert the black bg once
+        // per frame (256 index 16). 16-color can't do that — its per-cell SGR
+        // resets attributes to manage bold — so it folds a black bg into each
+        // fg change instead. Sentinels force the first changed cell to set color.
         self.last_fg = 255;
-        self.output_buffer.extend_from_slice(b"\x1b[48;5;16m");
+        self.last_bg = 255;
+        let is16 = self.config.depth == ColorDepth::C16;
+        if !is16 {
+            self.output_buffer.extend_from_slice(b"\x1b[48;5;16m");
+        }
 
         let out_cols = self.out_cols as usize;
         let out_rows = self.out_rows as usize;
@@ -388,10 +422,16 @@ impl Renderer {
                 let fg_g = ((top.g as u16 + bottom.g as u16) >> 1) as u8;
                 let fg_b = ((top.b as u16 + bottom.b as u16) >> 1) as u8;
 
-                let fg_color = Self::rgb_to_256(fg_r, fg_g, fg_b);
+                // bg is part of the cell identity: 16-color keeps black (0) in the
+                // paired SGR, 256/true ride the once-per-frame bg (index 16).
+                let (fg_color, bg_id) = if is16 {
+                    (color::nearest16(fg_r, fg_g, fg_b, j, i), 0)
+                } else {
+                    (color::xterm256(fg_r, fg_g, fg_b), 16)
+                };
 
                 let idx = i * out_cols + j;
-                let cell = Cell { ch: ascii_char, fg: fg_color, bg: 16 };
+                let cell = Cell { ch: ascii_char, fg: fg_color, bg: bg_id };
                 if self.prev_cells[idx] == cell {
                     drawing = false; // unchanged: skip, breaking any run
                     continue;
@@ -401,7 +441,11 @@ impl Renderer {
                     self.move_to(row, self.left_pad + 1 + j as u16);
                     drawing = true;
                 }
-                self.set_fg_256(fg_color);
+                if is16 {
+                    self.set_pair_16(fg_color, 0); // fg + black bg
+                } else {
+                    self.set_fg_256(fg_color);
+                }
                 self.output_buffer.push(ascii_char);
                 self.prev_cells[idx] = cell;
             }
@@ -430,7 +474,7 @@ mod tests {
 
     #[test]
     fn block_delta_skips_unchanged_and_repaints_only_changed() {
-        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Block });
+        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Block, depth: ColorDepth::C256 });
         r.update_dimensions(20, 11); // -> 20x9 output grid
         let cells = r.out_cols as usize * r.out_rows as usize;
         assert_eq!(cells, 180);
@@ -461,7 +505,7 @@ mod tests {
 
     #[test]
     fn resize_forces_full_repaint() {
-        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Block });
+        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Block, depth: ColorDepth::C256 });
         r.update_dimensions(20, 11);
         let fb = FrameBuffer::new(GB_WIDTH, GB_HEIGHT);
         let mut sink = Vec::new();
@@ -481,7 +525,7 @@ mod tests {
 
     #[test]
     fn ascii_delta_steady_frame_is_minimal() {
-        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Ascii });
+        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Ascii, depth: ColorDepth::C256 });
         r.update_dimensions(20, 11);
         let fb = FrameBuffer::new(GB_WIDTH, GB_HEIGHT);
         let mut b1 = Vec::new();
@@ -491,5 +535,22 @@ mod tests {
         let mut b2 = Vec::new();
         r.render(&fb, &mut b2).unwrap();
         assert_eq!(b2, b"\x1b[48;5;16m\x1b[0m", "unchanged ASCII frame draws no cells");
+    }
+
+    #[test]
+    fn block_16color_uses_classic_sgr_and_packed_glyphs() {
+        let mut r = Renderer::new(RenderConfig { mode: RenderMode::Block, depth: ColorDepth::C16 });
+        r.update_dimensions(20, 11); // 20x9 grid
+        let cells = r.out_cols as usize * r.out_rows as usize;
+
+        // All-black frame: each half-block cell packs to fg=7,bg=0,glyph=space.
+        let fb = FrameBuffer::new(GB_WIDTH, GB_HEIGHT);
+        let mut b1 = Vec::new();
+        r.render(&fb, &mut b1).unwrap();
+        assert!(contains(&b1, b"\x1b[2J"), "first frame clears");
+        assert!(contains(&b1, b"\x1b[0;37;40m"), "classic 16-color SGR emitted");
+        assert!(!contains(&b1, b"38;5;"), "no 256-color SGR in 16-color mode");
+        assert_eq!(count(&b1, HALF_BLOCK), 0, "dark cells are spaces, not half-blocks");
+        assert_eq!(count(&b1, b' '), cells, "every cell painted as a space");
     }
 }

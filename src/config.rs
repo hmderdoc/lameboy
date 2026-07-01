@@ -40,6 +40,10 @@ pub struct Config {
     pub filter: Option<String>,
     /// Persisted screen-size mode: "auto" | "best".
     pub screen: Option<String>,
+    /// Persisted color depth: "auto" | "truecolor" | "256" | "16".
+    pub color: Option<String>,
+    /// Persisted DMG (non-color game) palette: "gray" | "green".
+    pub dmg_palette: Option<String>,
     /// File name of the last game the user launched, so the list reopens on it.
     pub last_game: Option<String>,
 }
@@ -77,6 +81,10 @@ pub fn load(user: Option<&str>) -> Config {
             cfg.filter = Some(val.trim().to_lowercase());
         } else if let Some(val) = line.strip_prefix("screen=") {
             cfg.screen = Some(val.trim().to_lowercase());
+        } else if let Some(val) = line.strip_prefix("color=") {
+            cfg.color = Some(val.trim().to_lowercase());
+        } else if let Some(val) = line.strip_prefix("dmg_palette=") {
+            cfg.dmg_palette = Some(val.trim().to_lowercase());
         } else if let Some(val) = line.strip_prefix("last_game=") {
             let v = val.trim();
             if !v.is_empty() {
@@ -115,6 +123,12 @@ pub fn save(user: Option<&str>, cfg: &Config) -> io::Result<()> {
     if let Some(ref s) = cfg.screen {
         contents.push_str(&format!("screen={}\n", s));
     }
+    if let Some(ref c) = cfg.color {
+        contents.push_str(&format!("color={}\n", c));
+    }
+    if let Some(ref p) = cfg.dmg_palette {
+        contents.push_str(&format!("dmg_palette={}\n", p));
+    }
     if let Some(ref g) = cfg.last_game {
         contents.push_str(&format!("last_game={}\n", g));
     }
@@ -139,6 +153,9 @@ pub struct DoorIni {
     pub roms: Option<String>,
     pub fps: Option<f64>,
     pub ansi_music: Option<bool>,
+    /// Sysop board-wide default color depth: "auto" | "truecolor" | "256" | "16".
+    /// A per-user menu choice overrides it; a caller with no saved pref inherits it.
+    pub color: Option<String>,
     /// Smallest APC audio clip emitted (ms); also the drop/skip granularity.
     pub audio_chunk_ms: Option<u32>,
     /// APC audio output sample rate (Hz); lower = less bandwidth on the link.
@@ -214,6 +231,11 @@ fn parse_door_ini(text: &str) -> DoorIni {
                 }
             }
             "fps" => ini.fps = val.parse::<f64>().ok().map(|f| f.clamp(5.0, 60.0)),
+            "color" | "color_depth" | "colour" => {
+                if !val.is_empty() {
+                    ini.color = Some(val.to_lowercase());
+                }
+            }
             "ansi_music" | "ansimusic" | "music" => {
                 ini.ansi_music = Some(matches!(
                     val.to_lowercase().as_str(),
@@ -247,6 +269,14 @@ mod tests {
         assert_eq!(i.roms.as_deref(), Some("/bbs/gb/roms"));
         assert_eq!(i.fps, Some(30.0));
         assert_eq!(i.ansi_music, Some(false));
+    }
+
+    #[test]
+    fn door_ini_parses_color_default() {
+        assert_eq!(parse_door_ini("color = 256\n").color.as_deref(), Some("256"));
+        assert_eq!(parse_door_ini("colour=16").color.as_deref(), Some("16"));
+        assert_eq!(parse_door_ini("color_depth = Auto").color.as_deref(), Some("auto"));
+        assert_eq!(parse_door_ini("fps=30").color, None);
     }
 
     #[test]

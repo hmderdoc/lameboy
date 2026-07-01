@@ -1,16 +1,19 @@
 use crossterm::{
     cursor::MoveTo,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Print, ResetColor, SetAttribute},
     terminal::{Clear, ClearType},
     Command,
 };
+use std::cell::Cell as StdCell;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::thread;
 
+use crate::color::{self, ColorDepth, ColorSetting};
 use crate::config;
 use crate::cp437::Cp437Writer;
+use crate::framebuffer::DmgPalette;
 use crate::keys::{Input, Key, MenuEvent};
 use crate::renderer::RenderMode;
 use crate::term::Term;
@@ -20,6 +23,10 @@ pub struct MenuConfig {
     pub rom_path: PathBuf,
     pub render_mode: RenderMode,
     pub sound: SoundMode,
+    /// Color-depth setting; run_game resolves it against the probe result.
+    pub color: ColorSetting,
+    /// DMG (non-color game) palette: neutral gray or the classic green LCD.
+    pub dmg_palette: DmgPalette,
 }
 
 /// Fallback ROM-row count used until the terminal answers a size probe. The live
@@ -28,9 +35,10 @@ const VISIBLE_ROWS: usize = 12;
 
 /// Row of the "Games:" header and the first ROM row. Everything above (the hint
 /// lines, the wordmark + settings band) is fixed height; the list below grows to
-/// fill whatever screen height the caller has.
-const GAMES_HEADER_Y: u16 = 9;
-const GAMES_START_Y: u16 = 10;
+/// fill whatever screen height the caller has. The settings band runs rows 3-9
+/// (header + six options), so the list starts below it.
+const GAMES_HEADER_Y: u16 = 11;
+const GAMES_START_Y: u16 = 12;
 
 /// ROM rows that fit under the header on a `term_rows`-tall screen (1 row of
 /// bottom margin), floored so the list is always usable.
@@ -213,6 +221,12 @@ struct MenuState {
     sound: SoundMode,
     filter: RomFilter,
     screen: ScreenSize,
+    // Color-depth setting and the DMG (non-color game) palette.
+    color: ColorSetting,
+    dmg_palette: DmgPalette,
+    // The depth the setting currently resolves to (Auto folds in the probe). Kept
+    // on the state so draw_menu can push it to the color accessors each frame.
+    resolved_depth: ColorDepth,
 
     // Per-user preference key (BBS user number); None for standalone use.
     user: Option<String>,
@@ -242,6 +256,8 @@ enum MenuSection {
     Audio,
     Filter,
     Screen,
+    Color,
+    DmgPalette,
     GameList,
 }
 
@@ -251,7 +267,9 @@ impl MenuSection {
             Self::RenderMode => Self::Audio,
             Self::Audio => Self::Filter,
             Self::Filter => Self::Screen,
-            Self::Screen => Self::GameList,
+            Self::Screen => Self::Color,
+            Self::Color => Self::DmgPalette,
+            Self::DmgPalette => Self::GameList,
             Self::GameList => Self::RenderMode,
         }
     }
@@ -262,35 +280,173 @@ impl MenuSection {
             Self::Audio => Self::RenderMode,
             Self::Filter => Self::Audio,
             Self::Screen => Self::Filter,
-            Self::GameList => Self::Screen,
+            Self::Color => Self::Screen,
+            Self::DmgPalette => Self::Color,
+            Self::GameList => Self::DmgPalette,
         }
     }
 }
 
 // Colors — the original Game Boy (DMG) LCD palette: dark green ink on the pale
 // pea-green "screen". Emphasis comes from value (how dark), not hue, the way the
-// real hardware did it. Hex refs: CADC9F / 8bac0f / 306230 / 0f380f.
-const SCREEN_BG: Color = Color::Rgb { r: 202, g: 220, b: 159 }; // #CADC9F — LCD background
-const INK: Color = Color::Rgb { r: 15, g: 56, b: 15 };         // #0f380f — darkest
-const INK_MID: Color = Color::Rgb { r: 48, g: 98, b: 48 };     // #306230 — mid green
-const MOSS: Color = Color::Rgb { r: 139, g: 172, b: 15 };      // #8bac0f — light olive
-const LIME: Color = Color::Rgb { r: 155, g: 188, b: 15 };      // #9bbc0f — classic GB green
+// real hardware did it. The menu is truecolor-native but adapts to the caller's
+// terminal (see `set_menu_depth`):
+//   - Truecolor: the exact green LCD values (CADC9F / 8bac0f / 306230 / 0f380f).
+//   - 256: those greens quantized to the xterm cube — still green, on-brand.
+//   - 16: a monochrome black/gray/white LCD; no ANSI-16 green reads well enough,
+//     and grayscale is the classic non-color Game Boy look anyway.
+thread_local! {
+    // One door serves one caller, so a per-thread "current depth" is safe (mirrors
+    // the spectre door's `colorMode` global). Set once detection resolves and on
+    // every in-menu color change; read by the accessors below and the `Normal`
+    // command (which has no other way to receive the depth).
+    static MENU_DEPTH: StdCell<ColorDepth> = const { StdCell::new(ColorDepth::True) };
+}
 
-const HIGHLIGHT_BG: Color = INK;   // selected row: dark "pixel" bar...
-const HIGHLIGHT_FG: Color = LIME;  // ...with bright GB-green text
-const DIM_COLOR: Color = MOSS;     // secondary / receding text
-const TEXT_COLOR: Color = INK_MID; // primary body text
-const ACCENT_COLOR: Color = INK_MID; // headers
-const KEY_COLOR: Color = INK;      // emphasis (keys, wordmark, selection marker) — darkest pops
+fn set_menu_depth(d: ColorDepth) {
+    MENU_DEPTH.with(|c| c.set(d));
+}
+fn menu_depth() -> ColorDepth {
+    MENU_DEPTH.with(|c| c.get())
+}
 
-/// Reset to the menu's "normal" cell — dark ink on the LCD background. Used in
-/// place of `ResetColor`, which would clear the background to the terminal
-/// default and punch dark holes in the green screen.
+/// Compact tag for a resolved depth, shown in the Auto color-setting value.
+fn depth_tag(d: ColorDepth) -> &'static str {
+    match d {
+        ColorDepth::True => "TC",
+        ColorDepth::C256 => "256",
+        ColorDepth::C16 => "16",
+    }
+}
+
+/// A menu color already resolved for the active depth. The three depths encode
+/// differently on the wire, so we carry the resolved form and let `Fg`/`Bg` write
+/// the matching SGR. Crucially, C16 emits *classic* 3N/4N/9N codes rather than
+/// crossterm's 38;5;N named-color form (which a true 16-color terminal can't read).
+#[derive(Clone, Copy)]
+enum MColor {
+    Rgb(u8, u8, u8), // truecolor
+    Idx256(u8),      // xterm-256 index
+    Ansi16(u8),      // classic ANSI index 0-15
+}
+
+/// Set the foreground to an `MColor`, in the encoding the depth needs.
+struct Fg(MColor);
+impl Command for Fg {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match self.0 {
+            MColor::Rgb(r, g, b) => write!(f, "\x1b[38;2;{r};{g};{b}m"),
+            MColor::Idx256(n) => write!(f, "\x1b[38;5;{n}m"),
+            // 0-7 -> 30-37; 8-15 -> aixterm bright 90-97 (avoids bold-state juggling).
+            MColor::Ansi16(n) if n < 8 => write!(f, "\x1b[3{n}m"),
+            MColor::Ansi16(n) => write!(f, "\x1b[9{}m", n - 8),
+        }
+    }
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Set the background to an `MColor`. Backgrounds stay in the 8 normal colors
+/// (bright bg is unreliable on classic terminals), so a bright index masks down.
+struct Bg(MColor);
+impl Command for Bg {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match self.0 {
+            MColor::Rgb(r, g, b) => write!(f, "\x1b[48;2;{r};{g};{b}m"),
+            MColor::Idx256(n) => write!(f, "\x1b[48;5;{n}m"),
+            MColor::Ansi16(n) => write!(f, "\x1b[4{}m", n & 7),
+        }
+    }
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Quantize a truecolor green to the active depth. Only reached for True/256;
+/// the C16 roles below pick an explicit ANSI gray instead.
+fn quant(r: u8, g: u8, b: u8) -> MColor {
+    match menu_depth() {
+        ColorDepth::True => MColor::Rgb(r, g, b),
+        _ => MColor::Idx256(color::xterm256(r, g, b)),
+    }
+}
+
+// The five palette anchors, depth-aware. C16 maps each to a fixed ANSI gray so
+// the LCD reads as clean monochrome instead of muddy near-greens. The grayscale
+// ramp is black(0) / dark-gray(8) / light-gray(7) / white(15); backgrounds stay
+// on 0-7 (see `Bg`).
+fn screen_bg() -> MColor { // #CADC9F — LCD background (light)
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(7),
+        _ => quant(202, 220, 159),
+    }
+}
+fn ink() -> MColor { // #0f380f — darkest
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(0),
+        _ => quant(15, 56, 15),
+    }
+}
+fn ink_mid() -> MColor { // #306230 — mid green (primary text)
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(0),
+        _ => quant(48, 98, 48),
+    }
+}
+fn moss() -> MColor { // #8bac0f — light olive (dim/receding)
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(8),
+        _ => quant(139, 172, 15),
+    }
+}
+fn lime() -> MColor { // #9bbc0f — classic GB green (bright highlight)
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(15),
+        _ => quant(155, 188, 15),
+    }
+}
+
+// Semantic roles (meaning unchanged; now depth-aware).
+fn highlight_bg() -> MColor { ink() }    // selected row: dark "pixel" bar...
+fn highlight_fg() -> MColor { lime() }   // ...with bright text
+fn dim_color() -> MColor { moss() }      // secondary / receding text
+fn text_color() -> MColor { ink_mid() }  // primary body text
+fn accent_color() -> MColor { ink_mid() } // headers
+fn key_color() -> MColor { ink() }       // emphasis (keys, wordmark, marker)
+
+// Fixed brand accents for the DMG shell decor (the "DOT MATRIX" rule and the
+// power LED). Unlike the palette above these stay red/blue/white at every depth —
+// the one splash of color in the otherwise monochrome/green LCD theme.
+fn accent_red() -> MColor {
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(9), // bright red
+        _ => quant(206, 51, 61),
+    }
+}
+fn accent_blue() -> MColor {
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(12), // bright blue
+        _ => quant(58, 97, 190),
+    }
+}
+fn accent_white() -> MColor {
+    match menu_depth() {
+        ColorDepth::C16 => MColor::Ansi16(15), // bright white
+        _ => quant(240, 240, 240),
+    }
+}
+
+/// Reset to the menu's "normal" cell — ink on the LCD background. Used in place
+/// of `ResetColor`, which would clear the background to the terminal default and
+/// punch holes in the screen.
 struct Normal;
 impl Command for Normal {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        SetForegroundColor(TEXT_COLOR).write_ansi(f)?;
-        SetBackgroundColor(SCREEN_BG).write_ansi(f)
+        Fg(text_color()).write_ansi(f)?;
+        Bg(screen_bg()).write_ansi(f)
     }
     #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
@@ -328,6 +484,39 @@ fn logo_shear(pixel_row: usize) -> usize {
     (LOGO_PX_H - 1 - pixel_row) / 2
 }
 
+/// Total column width the wordmark occupies, so the header band above it can be
+/// sized to match. Each glyph contributes its width plus a 1-col inter-letter
+/// gap; the italic shear adds a few columns on the right.
+fn logo_width() -> usize {
+    let cells: usize = LOGO_TEXT.chars().map(|c| logo_glyph(c)[0].len() + 1).sum();
+    cells + logo_shear(0)
+}
+
+/// Draw the Game Boy "DOT MATRIX WITH STEREO SOUND" band: the white label
+/// centered on a red-over-blue half-block rule (red top pixel-row, blue bottom),
+/// with two columns of padding between the rule and the text. Sized to `width` so
+/// it lines up with the wordmark below it. The red/blue stay colored at every
+/// depth — the one deliberate splash of color in the LCD theme.
+fn draw_dmg_header<W: Write + ?Sized>(stdout: &mut W, x: u16, y: u16, width: usize) -> io::Result<()> {
+    const TEXT: &str = "DOT MATRIX WITH STEREO SOUND";
+    const PAD: usize = 2;
+    let rule = width.saturating_sub(TEXT.len() + PAD * 2);
+    let left = rule / 2;
+    let right = rule - left;
+    let pad = " ".repeat(PAD);
+    emit!(
+        stdout,
+        MoveTo(x, y),
+        Fg(accent_red()), Bg(accent_blue()), Print("▀".repeat(left)),
+        Bg(screen_bg()), Print(pad.clone()),
+        Fg(accent_white()), Print(TEXT),
+        Print(pad),
+        Fg(accent_red()), Bg(accent_blue()), Print("▀".repeat(right)),
+        NORMAL
+    )?;
+    Ok(())
+}
+
 /// Draw the "LAME BOY" wordmark at (x, y): half-block rendered with the italic
 /// slant baked into the bitmap (so the diagonals smooth out), in the darkest ink.
 fn draw_logo<W: Write + ?Sized>(stdout: &mut W, x: u16, y: u16) -> io::Result<()> {
@@ -353,7 +542,7 @@ fn draw_logo<W: Write + ?Sized>(stdout: &mut W, x: u16, y: u16) -> io::Result<()
             .unwrap_or(false)
     };
 
-    emit!(stdout, SetForegroundColor(KEY_COLOR), SetBackgroundColor(SCREEN_BG))?;
+    emit!(stdout, Fg(key_color()), Bg(screen_bg()))?;
     for cr in 0..char_rows {
         let top_r = cr * 2;
         let bot_r = cr * 2 + 1;
@@ -376,11 +565,11 @@ fn draw_logo<W: Write + ?Sized>(stdout: &mut W, x: u16, y: u16) -> io::Result<()
 
 /// Draw a selection caret: blinking when its menu zone is focused, dimmed (not
 /// hidden) when it isn't, so both menus always show where the cursor sits.
-fn draw_caret<W: Write + ?Sized>(stdout: &mut W, active: bool, active_fg: Color) -> io::Result<()> {
+fn draw_caret<W: Write + ?Sized>(stdout: &mut W, active: bool, active_fg: MColor) -> io::Result<()> {
     if active {
-        emit!(stdout, SetAttribute(Attribute::SlowBlink), SetForegroundColor(active_fg), Print("▶"), SetAttribute(Attribute::NoBlink))
+        emit!(stdout, SetAttribute(Attribute::SlowBlink), Fg(active_fg), Print("▶"), SetAttribute(Attribute::NoBlink))
     } else {
-        emit!(stdout, SetForegroundColor(DIM_COLOR), Print("▶"))
+        emit!(stdout, Fg(dim_color()), Print("▶"))
     }
 }
 
@@ -394,7 +583,7 @@ fn draw_zone_header<W: Write + ?Sized>(
     label: &str,
     active: bool,
 ) -> io::Result<()> {
-    emit!(stdout, MoveTo(x, y), SetForegroundColor(ACCENT_COLOR))?;
+    emit!(stdout, MoveTo(x, y), Fg(accent_color()))?;
     if active {
         emit!(
             stdout,
@@ -411,7 +600,7 @@ fn draw_zone_header<W: Write + ?Sized>(
 /// Brief splash before the menu (first entry only). Kept tiny so it works on a
 /// short screen and doesn't feel like a separate app.
 fn play_startup_animation<W: Write + ?Sized>(stdout: &mut W) -> io::Result<()> {
-    emit!(stdout, SetBackgroundColor(SCREEN_BG), Clear(ClearType::All))?;
+    emit!(stdout, Bg(screen_bg()), Clear(ClearType::All))?;
     draw_logo(stdout, 16, 8)?; // centered-ish splash
     stdout.flush()?;
     thread::sleep(Duration::from_millis(450));
@@ -419,7 +608,12 @@ fn play_startup_animation<W: Write + ?Sized>(stdout: &mut W) -> io::Result<()> {
 }
 
 impl MenuState {
-    fn new(user: Option<&str>, roms_override: Option<&str>) -> Self {
+    fn new(
+        user: Option<&str>,
+        roms_override: Option<&str>,
+        color_default: ColorSetting,
+        dmg_default: DmgPalette,
+    ) -> Self {
         let saved = config::load(user);
         // ROM directory precedence (all sysop-controlled): explicit --roms,
         // then a persisted roms_dir, then the working directory (scan_for_roms
@@ -430,6 +624,9 @@ impl MenuState {
             .or_else(|| saved.roms_dir.filter(|p| p.is_dir()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let rom_files = scan_for_roms(&roms_dir);
+
+        // Saved per-user color pref wins; else the CLI/ini default (or Auto).
+        let color = saved.color.as_deref().and_then(ColorSetting::parse).unwrap_or(color_default);
 
         let mut state = Self {
             // New users default to Block (the richer renderer); a saved choice
@@ -442,6 +639,10 @@ impl MenuState {
             sound: saved.sound.as_deref().map(SoundMode::from_code).unwrap_or(SoundMode::Ansi),
             filter: saved.filter.as_deref().map(RomFilter::from_code).unwrap_or(RomFilter::All),
             screen: saved.screen.as_deref().map(ScreenSize::from_code).unwrap_or(ScreenSize::Auto),
+            color,
+            dmg_palette: saved.dmg_palette.as_deref().and_then(DmgPalette::parse).unwrap_or(dmg_default),
+            // Refined from the probe on the first redraw (see run_menu_loop).
+            resolved_depth: color.resolve(None),
             user: user.map(|u| u.to_string()),
             rom_files,
             filtered: Vec::new(),
@@ -479,6 +680,21 @@ impl MenuState {
     fn cycle_filter(&mut self) {
         self.filter = self.filter.next();
         self.rebuild_filter();
+        self.persist_prefs();
+    }
+
+    fn cycle_color(&mut self, forward: bool) {
+        self.color = if forward { self.color.next() } else { self.color.prev() };
+        self.persist_prefs();
+    }
+
+    fn cycle_dmg(&mut self) {
+        // No-op in 16-color: the palette is "N/A" there, so leave the stored
+        // preference untouched (it applies again on a color terminal).
+        if self.resolved_depth == ColorDepth::C16 {
+            return;
+        }
+        self.dmg_palette = self.dmg_palette.next();
         self.persist_prefs();
     }
 
@@ -595,6 +811,8 @@ impl MenuState {
                 sound: Some(self.sound.code().to_string()),
                 filter: Some(self.filter.code().to_string()),
                 screen: Some(self.screen.code().to_string()),
+                color: Some(self.color.slug().to_string()),
+                dmg_palette: Some(self.dmg_palette.slug().to_string()),
                 last_game: saved.last_game,
             },
         );
@@ -656,6 +874,7 @@ fn scan_for_roms(dir: &Path) -> Vec<PathBuf> {
 /// `user` is an optional per-user key (the BBS user number) used to load and
 /// persist that caller's render/audio/filter preferences. `animate` controls
 /// whether the GBC startup sweep plays (skipped when returning from a game).
+#[allow(clippy::too_many_arguments)]
 pub fn show_menu(
     term: &mut dyn Term,
     input: &mut Input,
@@ -663,8 +882,13 @@ pub fn show_menu(
     roms_override: Option<&str>,
     animate: bool,
     screen_orig: &mut Option<(u16, u16)>,
+    color_default: ColorSetting,
+    dmg_default: DmgPalette,
 ) -> io::Result<Option<MenuConfig>> {
-    let mut state = MenuState::new(user, roms_override);
+    let mut state = MenuState::new(user, roms_override, color_default, dmg_default);
+    // Seed the color accessors so the startup splash draws at the right depth
+    // (refined once the probe answers, on the first menu redraw).
+    set_menu_depth(state.resolved_depth);
 
     // Play the GBC-style startup animation (first entry only). The alternate
     // screen / raw mode are owned by the caller and shared with the game.
@@ -724,6 +948,10 @@ fn run_menu_loop(
 
     'redraw: loop {
         state.visible_rows = visible_for(term_rows);
+        // Re-resolve the color depth: for Auto this folds in the probe reply once
+        // it lands (the burst rides the size probe), so the menu self-corrects
+        // from its truecolor default to 256 on the first redraw after detection.
+        state.resolved_depth = state.color.resolve(input.color_probe());
 
         // Draw through a CP437 adapter over the shared terminal, then release the
         // borrow so we can read input from the same terminal.
@@ -740,6 +968,12 @@ fn run_menu_loop(
         // Wait for a key, applying any size reports in between (redraw only when
         // the height actually changes, so a stable size doesn't busy-loop).
         let key = loop {
+            // The color probe reply rides the size-probe burst; when it lands and
+            // changes the resolved depth (Auto -> 256), repaint at the new depth
+            // even if the terminal size didn't change.
+            if state.color.resolve(input.color_probe()) != state.resolved_depth {
+                continue 'redraw;
+            }
             match input.wait_event(term)? {
                 MenuEvent::Key(k) => break k,
                 MenuEvent::Resize(rows, cols) => {
@@ -881,6 +1115,8 @@ fn run_menu_loop(
                         };
                         apply_screen(state, term, screen_orig, term_rows, term_cols);
                     }
+                    MenuSection::Color => state.cycle_color(key != Key::Left),
+                    MenuSection::DmgPalette => state.cycle_dmg(),
                     _ => {}
                 }
             }
@@ -898,6 +1134,8 @@ fn run_menu_loop(
                                 rom_path,
                                 render_mode: state.render_mode,
                                 sound: state.sound,
+                                color: state.color,
+                                dmg_palette: state.dmg_palette,
                             }));
                         }
                     }
@@ -908,6 +1146,8 @@ fn run_menu_loop(
                         state.screen = state.screen.next();
                         apply_screen(state, term, screen_orig, term_rows, term_cols);
                     }
+                    MenuSection::Color => state.cycle_color(true),
+                    MenuSection::DmgPalette => state.cycle_dmg(),
                 }
             }
             _ => {}
@@ -921,30 +1161,37 @@ fn run_menu_loop(
 }
 
 fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
+    // Push the resolved depth to the color accessors before anything draws, so the
+    // whole menu paints at the caller's color depth (truecolor / 256 / 16).
+    set_menu_depth(state.resolved_depth);
+
     // Paint the whole screen the Game Boy LCD background, then draw dark ink on it.
-    emit!(stdout, SetBackgroundColor(SCREEN_BG), Clear(ClearType::All))?;
+    emit!(stdout, Bg(screen_bg()), Clear(ClearType::All))?;
 
     // Hints at the very top so they stay in view on tall terminals.
     emit!(
         stdout,
         MoveTo(3, 0),
-        SetForegroundColor(KEY_COLOR), Print("↑↓"), SetForegroundColor(DIM_COLOR), Print(" move   "),
-        SetForegroundColor(KEY_COLOR), Print("Tab"), SetForegroundColor(DIM_COLOR), Print(" settings/list   "),
-        SetForegroundColor(KEY_COLOR), Print("◄►"), SetForegroundColor(DIM_COLOR), Print(" change   "),
-        SetForegroundColor(KEY_COLOR), Print("Z/Enter"), SetForegroundColor(DIM_COLOR), Print(" play   "),
-        SetForegroundColor(KEY_COLOR), Print("Esc"), SetForegroundColor(DIM_COLOR), Print(" quit"),
+        Fg(key_color()), Print("↑↓"), Fg(dim_color()), Print(" move   "),
+        Fg(key_color()), Print("Tab"), Fg(dim_color()), Print(" settings/list   "),
+        Fg(key_color()), Print("◄►"), Fg(dim_color()), Print(" change   "),
+        Fg(key_color()), Print("Z/Enter"), Fg(dim_color()), Print(" play   "),
+        Fg(key_color()), Print("Esc"), Fg(dim_color()), Print(" quit"),
         NORMAL
     )?;
     emit!(
         stdout,
         MoveTo(4, 1),
-        SetForegroundColor(KEY_COLOR), Print("type"), SetForegroundColor(DIM_COLOR), Print(" any letters to jump to a game"),
+        Fg(key_color()), Print("type"), Fg(dim_color()), Print(" any letters to jump to a game"),
         NORMAL
     )?;
 
-    // Wordmark on the left (rows 3-7); Settings menu to its right. The settings
-    // caret tracks last_settings so it stays put (dimmed) while the list is focused.
-    draw_logo(stdout, 2, 3)?;
+    // DMG "DOT MATRIX WITH STEREO SOUND" band (row 3), a blank margin (row 4),
+    // then the wordmark below it (rows 5-9). Settings menu sits to the right.
+    // The settings caret tracks last_settings so it stays put (dimmed) while the
+    // list is focused.
+    draw_dmg_header(stdout, 2, 3, logo_width())?;
+    draw_logo(stdout, 2, 5)?;
 
     let settings_x: u16 = 54;
     let zone_settings = state.current_section != MenuSection::GameList;
@@ -957,6 +1204,20 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
     draw_option(stdout, settings_x, 5, "Sound", state.sound.label().trim(), state.last_settings == MenuSection::Audio, zone_settings)?;
     draw_option(stdout, settings_x, 6, "Filter", state.filter.label().trim(), state.last_settings == MenuSection::Filter, zone_settings)?;
     draw_option(stdout, settings_x, 7, "Size", state.screen.label(), state.last_settings == MenuSection::Screen, zone_settings)?;
+    // Color depth: show the setting; for Auto also show what it resolved to.
+    let color_value = match state.color {
+        ColorSetting::Auto => format!("Auto/{}", depth_tag(state.resolved_depth)),
+        other => other.label().to_string(),
+    };
+    draw_option(stdout, settings_x, 8, "Color", &color_value, state.last_settings == MenuSection::Color, zone_settings)?;
+    // The DMG palette has no effect in 16-color (green falls back to gray), so it
+    // reads "N/A" and can't be changed there.
+    let dmg_value = if state.resolved_depth == ColorDepth::C16 {
+        "N/A"
+    } else {
+        state.dmg_palette.label()
+    };
+    draw_option(stdout, settings_x, 9, "DMG", dmg_value, state.last_settings == MenuSection::DmgPalette, zone_settings)?;
 
     // Optional, low-key nudge about terminal size for the sharpest game picture.
     // Semi-dark ink on a semi-light olive bar so it reads as a tip, not a warning;
@@ -965,9 +1226,9 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
     if state.screen != ScreenSize::Best {
         emit!(
             stdout,
-            MoveTo(2, 8),
-            SetBackgroundColor(LIME),
-            SetForegroundColor(INK_MID),
+            MoveTo(2, 10),
+            Bg(lime()),
+            Fg(ink_mid()),
             Print(" Optional: set Size to Best (or use a 162x74 terminal) for the sharpest picture "),
             NORMAL
         )?;
@@ -986,9 +1247,9 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         emit!(
             stdout,
             MoveTo(44, GAMES_HEADER_Y),
-            SetForegroundColor(KEY_COLOR),
+            Fg(key_color()),
             Print("Find: "),
-            SetForegroundColor(TEXT_COLOR),
+            Fg(text_color()),
             Print(truncate_str(&state.typeahead, 20)),
             NORMAL
         )?;
@@ -1001,7 +1262,7 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         } else {
             "No games match this filter"
         };
-        emit!(stdout, MoveTo(4, games_start_y), SetForegroundColor(DIM_COLOR), Print(msg), NORMAL)?;
+        emit!(stdout, MoveTo(4, games_start_y), Fg(dim_color()), Print(msg), NORMAL)?;
     } else {
         let visible_count = state.visible_rows.min(state.filtered.len());
         let is_game_list_selected = state.current_section == MenuSection::GameList;
@@ -1035,10 +1296,10 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         // Scroll indicators
         let arrow_x: u16 = 65;
         if state.scroll_offset > 0 {
-            emit!(stdout, MoveTo(arrow_x, games_start_y), SetForegroundColor(KEY_COLOR), Print("▲"), NORMAL)?;
+            emit!(stdout, MoveTo(arrow_x, games_start_y), Fg(key_color()), Print("▲"), NORMAL)?;
         }
         if state.scroll_offset + visible_count < state.filtered.len() {
-            emit!(stdout, MoveTo(arrow_x, games_start_y + visible_count as u16 - 1), SetForegroundColor(KEY_COLOR), Print("▼"), NORMAL)?;
+            emit!(stdout, MoveTo(arrow_x, games_start_y + visible_count as u16 - 1), Fg(key_color()), Print("▼"), NORMAL)?;
         }
     }
 
@@ -1064,29 +1325,40 @@ fn draw_rom_row(
     let bar = selected && zone_active;
     emit!(stdout, MoveTo(4, y))?;
     if bar {
-        emit!(stdout, SetBackgroundColor(HIGHLIGHT_BG))?;
+        emit!(stdout, Bg(highlight_bg()))?;
     }
-    // Caret cell (" ▶ " or "   "), on the bar background when active.
+    // Selection indicator (" * " or "   "): the Game Boy's red power LED, flashing
+    // while the list is focused, on the bar background when active.
     if selected {
         emit!(stdout, Print(" "))?;
-        draw_caret(stdout, zone_active, HIGHLIGHT_FG)?;
+        if zone_active {
+            emit!(
+                stdout,
+                SetAttribute(Attribute::SlowBlink),
+                Fg(accent_red()),
+                Print("*"),
+                SetAttribute(Attribute::NoBlink)
+            )?;
+        } else {
+            emit!(stdout, Fg(accent_red()), Print("*"))?;
+        }
         emit!(stdout, Print(" "))?;
     } else {
         emit!(stdout, Print("   "))?;
     }
     // Name + tag.
     let (name_color, tag_color) = if bar {
-        (HIGHLIGHT_FG, if is_gbc { LIME } else { SCREEN_BG })
+        (highlight_fg(), if is_gbc { lime() } else { screen_bg() })
     } else if selected {
-        (KEY_COLOR, if is_gbc { INK } else { INK_MID })
+        (key_color(), if is_gbc { ink() } else { ink_mid() })
     } else {
-        (TEXT_COLOR, if is_gbc { INK } else { INK_MID })
+        (text_color(), if is_gbc { ink() } else { ink_mid() })
     };
     emit!(
         stdout,
-        SetForegroundColor(name_color),
+        Fg(name_color),
         Print(name),
-        SetForegroundColor(tag_color),
+        Fg(tag_color),
         Print(format!("{:<3} ", tag)),
         NORMAL
     )?;
@@ -1096,24 +1368,24 @@ fn draw_rom_row(
 /// `caret`: this row holds the settings cursor. `zone_active`: the settings menu
 /// (not the game list) is the focused zone — drives blink vs dim on the caret.
 fn draw_option(stdout: &mut impl Write, x: u16, y: u16, label: &str, value: &str, caret: bool, zone_active: bool) -> io::Result<()> {
-    let label_color = if caret && zone_active { KEY_COLOR } else { TEXT_COLOR };
-    let value_color = if caret { KEY_COLOR } else { DIM_COLOR };
-    let arrow_color = if caret { KEY_COLOR } else { DIM_COLOR };
+    let label_color = if caret && zone_active { key_color() } else { text_color() };
+    let value_color = if caret { key_color() } else { dim_color() };
+    let arrow_color = if caret { key_color() } else { dim_color() };
     emit!(stdout, MoveTo(x, y))?;
     if caret {
-        draw_caret(stdout, zone_active, KEY_COLOR)?;
+        draw_caret(stdout, zone_active, key_color())?;
     } else {
         emit!(stdout, Print(" "))?;
     }
     emit!(
         stdout,
-        SetForegroundColor(label_color),
+        Fg(label_color),
         Print(format!(" {:<7}", label)),
-        SetForegroundColor(arrow_color),
+        Fg(arrow_color),
         Print("◄ "),
-        SetForegroundColor(value_color),
+        Fg(value_color),
         Print(format!("{:<5}", value)),
-        SetForegroundColor(arrow_color),
+        Fg(arrow_color),
         Print(" ►"),
         NORMAL
     )?;
@@ -1158,7 +1430,7 @@ mod tests {
     fn menu_paints_the_gameboy_lcd_palette() {
         // Render the menu to a buffer (no terminal needed) and check the Game Boy
         // colors actually go out: the LCD background fill and the dark ink.
-        let state = MenuState::new(None, None);
+        let state = MenuState::new(None, None, ColorSetting::Auto, DmgPalette::Gray);
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = Cp437Writer::new(&mut buf);
@@ -1173,8 +1445,56 @@ mod tests {
     }
 
     #[test]
+    fn menu_draws_dmg_header_band() {
+        let state = MenuState::new(None, None, ColorSetting::Auto, DmgPalette::Gray);
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Cp437Writer::new(&mut buf);
+            draw_menu(&mut w, &state).unwrap();
+        }
+        assert!(contains(&buf, b"DOT MATRIX WITH STEREO SOUND"), "band label missing");
+        // Red-over-blue rule: CP437 upper-half block (0xDF), red fg on blue bg.
+        assert!(buf.contains(&0xDF), "half-block rule missing");
+        assert!(contains(&buf, b"\x1b[48;2;58;97;190m"), "blue rule bg (truecolor) missing");
+        assert!(contains(&buf, b"\x1b[38;2;206;51;61m"), "red rule fg (truecolor) missing");
+    }
+
+    #[test]
+    fn logo_width_matches_wordmark() {
+        // Documents the wordmark's column width (the header band is sized to it).
+        assert_eq!(logo_width(), 51);
+    }
+
+    #[test]
+    fn menu_degrades_for_non_truecolor_terminals() {
+        let render_at = |depth: ColorDepth| -> Vec<u8> {
+            let mut state = MenuState::new(None, None, ColorSetting::Auto, DmgPalette::Gray);
+            state.resolved_depth = depth;
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut w = Cp437Writer::new(&mut buf);
+                draw_menu(&mut w, &state).unwrap();
+            }
+            buf
+        };
+
+        // 256: greens quantized to the xterm cube (38;5 / 48;5), never truecolor.
+        let b256 = render_at(ColorDepth::C256);
+        assert!(contains(&b256, b"\x1b[48;5;"), "256 background SGR expected");
+        assert!(contains(&b256, b"\x1b[38;5;"), "256 foreground SGR expected");
+        assert!(!contains(&b256, b"38;2;") && !contains(&b256, b"48;2;"), "no truecolor in 256 mode");
+
+        // 16: only classic basic SGRs — no extended color at all, grey LCD screen.
+        let b16 = render_at(ColorDepth::C16);
+        for ext in [&b"38;5;"[..], b"48;5;", b"38;2;", b"48;2;"] {
+            assert!(!contains(&b16, ext), "extended color leaked into 16-color menu");
+        }
+        assert!(contains(&b16, b"\x1b[47m"), "grey LCD background (ANSI 47) expected");
+    }
+
+    #[test]
     fn page_keeps_cursor_at_same_viewport_row() {
-        let mut state = MenuState::new(None, None);
+        let mut state = MenuState::new(None, None, ColorSetting::Auto, DmgPalette::Gray);
         // A controlled 100-item list in a 10-row viewport.
         state.filtered = (0..100).collect();
         state.visible_rows = 10;
