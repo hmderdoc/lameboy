@@ -252,6 +252,11 @@ impl KeyDecoder {
                         b'C' => out.push(Key::Right),
                         b'D' => out.push(Key::Left),
                         b'Z' => out.push(Key::BackTab),
+                        // SyncTERM/CTerm transmit Page Up as `CSI V` and Page Down
+                        // as `CSI U` (cterm.c keytab: PPAGE=\033[V, NPAGE=\033[U).
+                        // xterm-family terminals send `CSI 5~`/`6~` instead (below).
+                        b'V' => out.push(Key::PageUp),
+                        b'U' => out.push(Key::PageDown),
                         b'R' => self.cursor = parse_cursor(&self.csi), // size probe reply
                         b'n' => {
                             // Device-status report; `=7;ch;0` is an audio drain.
@@ -504,8 +509,13 @@ mod tests {
     }
 
     #[test]
-    fn page_up_down_decode_from_vt_edit_keypad() {
+    fn page_up_down_decode_from_both_terminal_families() {
         let mut d = KeyDecoder::new();
+        // SyncTERM / CTerm: PPAGE = CSI V, NPAGE = CSI U (the ones that were
+        // silently dropped before). This is what a Mac SyncTERM actually sends.
+        assert_eq!(d.feed(b"\x1b[V"), [Key::PageUp]);
+        assert_eq!(d.feed(b"\x1b[U"), [Key::PageDown]);
+        // xterm-family (iTerm via the shim, fTelnet, PuTTY): CSI 5~ / 6~.
         assert_eq!(d.feed(b"\x1b[5~"), [Key::PageUp]);
         assert_eq!(d.feed(b"\x1b[6~"), [Key::PageDown]);
         // Modifier forms keep the same first field (e.g. Shift+PageUp).
