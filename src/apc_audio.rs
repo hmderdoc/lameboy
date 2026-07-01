@@ -39,6 +39,30 @@ const SLOTS: u8 = 8;
 /// not a tuning knob -- surplus beyond what this can compress is dropped instead.
 const MAX_CORRECTION_PCT: f32 = 2.0;
 
+// --- Dual-loop drift controller tuning ---------------------------------------
+// The declared playback rate is out_rate*(1 + cor), where cor = clamp(drift_ema
+// + cushion_trim). drift_ema is a slow (4s) low-pass of the true producer-vs-
+// wall skew and carries the whole steady ~1% correction as a near-DC value;
+// cushion_trim is a small deadbanded proportional nudge that walks queued lead
+// toward CUSHION_MS. cor is slew-limited so it can never bang rail-to-rail (the
+// failure mode of the earlier instantaneous-ratio controller). Drops happen only
+// when projected lead breaches a ceiling, refractory-limited -- so steady-state
+// drops are ~zero. See the design notes in the repo history.
+const MAX_COR: f64 = MAX_CORRECTION_PCT as f64 / 100.0; // hard +/-2% declared-rate cap
+const CUSHION_MS: u64 = 100; // queued-lead setpoint
+const CUSHION_PRIME_MS: u64 = 90; // silence pre-queued at prime / re-anchor
+const DEADBAND_MS: f64 = 25.0; // no cushion trim within +/-25ms of the setpoint
+const DRIFT_TAU_MS: f64 = 4000.0; // drift-EMA time constant
+const DRIFT_UPDATE_MS: u64 = 200; // drift measurement window (>= a few PCM lumps)
+const TRIM_GAIN: f64 = 0.004; // cushion trim per 100ms of past-deadband error
+const TRIM_MAX: f64 = 0.006; // cushion-trim magnitude clamp
+const SLEW_PER_TICK: f64 = 0.0008; // max change in cor per emit (0.08%)
+const CEILING_MS: u64 = 260; // drop when projected lead exceeds this (steady state)
+const WARMUP_MS: u64 = 12000; // startup window with a higher drop ceiling
+const WARMUP_CEILING_MS: u64 = 500;
+const DROP_REFRACTORY_MS: u64 = 400; // minimum spacing between drops
+const DROP_TARGET_MS: u64 = 100; // lead to settle to after a drop
+
 /// A snapshot of the stream's health for the on-screen/log diagnostics.
 #[derive(Clone, Copy, Default)]
 pub struct ApcStats {
@@ -62,11 +86,19 @@ pub struct ApcAudio {
     slot: u8,
     primed: bool,
     play_start_ms: u64, // wall-clock anchor for the realtime playback timeline
-    emitted_ms: u64,    // realtime audio handed to the terminal since the anchor
+    emitted_ms: f64,    // realtime audio handed to the terminal since the anchor
+                        // (fractional ms; integer truncation here decays lead)
 
     // Measured cushion: the rolling max gap between emit calls (link jitter).
     last_now_ms: u64,
     jitter_ms: u64,
+
+    // Dual-loop drift controller state.
+    cor: f64,                // current applied declared-rate correction c
+    drift_ema: f64,          // slow low-pass of the true producer/consumer skew
+    drift_win_start_ms: u64, // wall time the current drift window opened
+    drift_win_prod0: u64,    // produced_samples snapshot at that window start
+    last_drop_ms: u64,       // wall time of the last drop (refractory gate)
 
     // Diagnostics.
     start_ms: u64,
@@ -94,9 +126,14 @@ impl ApcAudio {
             slot: 0,
             primed: false,
             play_start_ms: 0,
-            emitted_ms: 0,
+            emitted_ms: 0.0,
             last_now_ms: 0,
             jitter_ms: 0,
+            cor: 0.0,
+            drift_ema: 0.0,
+            drift_win_start_ms: 0,
+            drift_win_prod0: 0,
+            last_drop_ms: 0,
             start_ms: 0,
             produced_samples: 0,
             drops: 0,
@@ -122,84 +159,136 @@ impl ApcAudio {
         }
     }
 
-    /// Send one reconciled clip for this tick. `now_ms` is a monotonic wall clock
-    /// (e.g. session-start elapsed). Call once per frame.
+    /// Ship one reconciled clip for this tick, holding queued lead near a fixed
+    /// cushion via a slow drift feed-forward plus a small deadbanded trim, with the
+    /// declared rate slew-limited so it can never bang between the +/-2% rails.
+    /// `now_ms` is a monotonic wall clock. Call once per game-loop tick.
     pub fn emit_ready<W: Write + ?Sized>(&mut self, out: &mut W, now_ms: u64) -> io::Result<()> {
+        // STEP 0 -- prime: anchor the timeline and pre-queue a silence cushion so
+        // lead starts at the setpoint instead of riding the underrun edge.
         if !self.primed {
             self.play_start_ms = now_ms;
             self.start_ms = now_ms;
             self.last_now_ms = now_ms;
-            self.emitted_ms = 0;
+            self.drift_win_start_ms = now_ms;
+            self.drift_win_prod0 = self.produced_samples;
+            self.emitted_ms = 0.0;
+            self.cor = 0.0;
+            self.drift_ema = 0.0;
+            self.last_drop_ms = 0;
             self.primed = true;
             self.arm_update(out)?;
+            self.emit_silence(CUSHION_PRIME_MS, out)?;
+            self.emitted_ms += CUSHION_PRIME_MS as f64;
             out.flush()?;
+            return Ok(());
         }
 
-        // Measured cushion: decaying max of the interval between emit calls.
+        // STEP 1 -- cadence/jitter now only sizes the smallest clip we bother with.
         let gap = now_ms.saturating_sub(self.last_now_ms);
         self.last_now_ms = now_ms;
         self.jitter_ms = (self.jitter_ms * 15 / 16).max(gap);
-        let target = self.min_send.max(self.jitter_ms);
+        let min_clip_ms = self.min_send.max(self.jitter_ms);
 
+        // STEP 2 -- observe queued lead (the controlled variable).
         let elapsed = now_ms.saturating_sub(self.play_start_ms);
-        self.lead_ms = self.emitted_ms.saturating_sub(elapsed) as u32;
+        self.lead_ms = (self.emitted_ms - elapsed as f64).max(0.0) as u32;
 
-        // How much realtime audio the schedule wants queued by now, beyond what
-        // we've already sent.
-        let need_ms = (elapsed + target).saturating_sub(self.emitted_ms);
-        let avail = self.accum.len();
-        let avail_ms = avail as u64 * 1000 / self.out_rate as u64;
-        if need_ms == 0 || avail == 0 {
-            return Ok(());
-        }
-        // Ahead of schedule with only a sliver buffered: wait for a fuller clip.
-        if avail_ms < need_ms && avail_ms < self.min_send {
-            return Ok(());
+        // STEP 3 -- slow loop 1: update the drift EMA over a >=200ms window, so it
+        // integrates several PCM lumps and is immune to per-tick quantization.
+        let win = now_ms.saturating_sub(self.drift_win_start_ms);
+        if win >= DRIFT_UPDATE_MS {
+            let prod = self.produced_samples.saturating_sub(self.drift_win_prod0);
+            let produced_ms = prod as f64 * 1000.0 / self.out_rate as f64;
+            let inst_drift = produced_ms / win as f64 - 1.0;
+            let alpha = win as f64 / (DRIFT_TAU_MS + win as f64);
+            self.drift_ema += alpha * (inst_drift - self.drift_ema);
+            self.drift_win_start_ms = now_ms;
+            self.drift_win_prod0 = self.produced_samples;
         }
 
-        // Work the ratio in samples, not whole ms: at small tick sizes integer-ms
-        // resolution is far coarser than the 2% correction band.
-        let need_samples = need_ms as f32 * self.out_rate as f32 / 1000.0;
-        let max_ratio = 1.0 + MAX_CORRECTION_PCT / 100.0;
-        let (send_samples, rate, played_ms, dropped) = if (avail as f32) <= need_samples {
-            // Keeping up or behind: send everything at its true rate.
-            (avail, self.out_rate, avail_ms, 0usize)
+        // STEP 4 -- slow loop 2: deadbanded proportional cushion trim. Too much
+        // buffer (err>0) -> trim>0 -> play faster -> spend it; too little -> stretch.
+        let err_ms = self.lead_ms as f64 - CUSHION_MS as f64;
+        let trim = if err_ms.abs() <= DEADBAND_MS {
+            0.0
         } else {
-            let ratio = avail as f32 / need_samples;
-            if ratio <= max_ratio {
-                // Small drift: compress all of it into need_ms by declaring a
-                // faster rate; the terminal resamples and the drift vanishes.
-                let rate = (self.out_rate as f32 * ratio).round() as u32;
-                (avail, rate, need_ms, 0)
-            } else {
-                // Big surplus (stall): compress at the cap, drop the oldest part
-                // that still won't fit so playback skips once to the present.
-                let keep = ((need_samples * max_ratio) as usize).min(avail);
-                let drop = avail - keep;
-                let rate = (self.out_rate as f32 * max_ratio).round() as u32;
-                (keep, rate, need_ms, drop)
-            }
+            let eff = err_ms - err_ms.signum() * DEADBAND_MS;
+            (TRIM_GAIN * (eff / 100.0)).clamp(-TRIM_MAX, TRIM_MAX)
         };
 
-        if dropped > 0 {
-            self.accum.drain(0..dropped);
-            self.drops += 1;
+        // STEP 5 -- combine, clamp, slew-limit into the applied correction c.
+        let c_cmd = (self.drift_ema + trim).clamp(-MAX_COR, MAX_COR);
+        let dc = (c_cmd - self.cor).clamp(-SLEW_PER_TICK, SLEW_PER_TICK);
+        self.cor = (self.cor + dc).clamp(-MAX_COR, MAX_COR);
+        let declared_rate = (self.out_rate as f64 * (1.0 + self.cor)).round() as u32;
+        self.correction_pct = (self.cor * 100.0) as f32;
+
+        // STEP 6 -- decide how much to send (structural, independent of cor). Keep
+        // emitted tracking elapsed + CUSHION_MS (a FIXED setpoint, not jitter), so
+        // lead is a real pre-queued cushion rather than the underrun edge.
+        let avail = self.accum.len();
+        if avail == 0 {
+            return Ok(());
         }
-        self.correction_pct = (rate as f32 / self.out_rate as f32 - 1.0) * 100.0;
-        self.emit_chunk(send_samples, rate, out)?;
+        let avail_ms = avail as u64 * 1000 / self.out_rate as u64;
+        let need_ms = (elapsed as f64 + CUSHION_MS as f64 - self.emitted_ms).max(0.0) as u64;
+        // Ahead of schedule with only a sliver buffered: wait for a fuller clip.
+        if need_ms == 0 && avail_ms < min_clip_ms {
+            return Ok(());
+        }
+        let want_ms = need_ms.max(min_clip_ms);
+        let mut send_samples = avail.min((want_ms * self.out_rate as u64 / 1000) as usize);
+
+        // STEP 7 -- drop gate: shed the oldest backlog only when projected lead
+        // overshoots the ceiling, at most once per refractory window. A rare
+        // stall/burst safety net -- steady-state drift is absorbed by cor, so lead
+        // stays near the setpoint and this never fires after warmup.
+        let ceiling = if now_ms.saturating_sub(self.start_ms) < WARMUP_MS {
+            WARMUP_CEILING_MS
+        } else {
+            CEILING_MS
+        };
+        let clip_ms = send_samples as f64 * 1000.0 / declared_rate.max(1) as f64;
+        let proj_lead = (self.emitted_ms + clip_ms - elapsed as f64).max(0.0) as u64;
+        let can_drop = self.last_drop_ms == 0
+            || now_ms.saturating_sub(self.last_drop_ms) >= DROP_REFRACTORY_MS;
+        if proj_lead > ceiling && can_drop {
+            let excess_ms = proj_lead - DROP_TARGET_MS;
+            let drop_samples = avail.min((excess_ms * self.out_rate as u64 / 1000) as usize);
+            self.accum.drain(0..drop_samples);
+            self.drops += 1;
+            self.last_drop_ms = now_ms;
+            let avail2 = self.accum.len();
+            if avail2 == 0 {
+                return Ok(());
+            }
+            send_samples = avail2.min((want_ms * self.out_rate as u64 / 1000) as usize);
+        }
+
+        // STEP 8 -- emit the clip; advance the timeline by the realtime it occupies.
+        if send_samples == 0 {
+            return Ok(());
+        }
+        self.emit_chunk(send_samples, declared_rate, out)?;
+        let played_ms = send_samples as f64 * 1000.0 / declared_rate.max(1) as f64;
         self.emitted_ms += played_ms;
         out.flush()?;
         Ok(())
     }
 
-    /// Handle the terminal's `CSI = 7 ; <ch> ; 0 n` drain notification: the FIFO
-    /// emptied, so the playback timeline is stale. Re-anchor to "queued == 0 now"
-    /// and re-arm the one-shot notification.
+    /// Handle the terminal's `CSI = 7 ; <ch> ; 0 n` drain notification (an
+    /// underrun): re-anchor the timeline and re-prime the silence cushion so lead
+    /// restarts at the setpoint. The drift EMA and correction SURVIVE the
+    /// re-anchor, so the first post-anchor clip rides the stable ~1% cor instead
+    /// of a fresh ratio. After warmup this path should essentially never fire.
     pub fn notify_drain<W: Write + ?Sized>(&mut self, out: &mut W, now_ms: u64) -> io::Result<()> {
         self.play_start_ms = now_ms;
-        self.emitted_ms = 0;
+        self.emitted_ms = 0.0;
         self.lead_ms = 0;
         self.arm_update(out)?;
+        self.emit_silence(CUSHION_PRIME_MS, out)?;
+        self.emitted_ms += CUSHION_PRIME_MS as f64;
         out.flush()
     }
 
@@ -233,13 +322,29 @@ impl ApcAudio {
         Ok(())
     }
 
-    /// Emit one clip of `n` samples at the given declared sample rate, as
-    /// Store+Load+Queue. The declared rate is the resample knob: higher than the
-    /// true `out_rate` makes the terminal play the clip back faster (compressed).
+    /// Emit one clip of `n` backlog samples at the given declared rate, draining
+    /// them from accum. A rate above the true `out_rate` makes the terminal play
+    /// the clip back faster (compressed), which is how drift is absorbed.
     fn emit_chunk<W: Write + ?Sized>(&mut self, n: usize, rate: u32, out: &mut W) -> io::Result<()> {
         let wav = encode_wav_mono(&self.accum[..n], rate);
         self.accum.drain(0..n);
-        let b64 = base64_encode(&wav);
+        self.send_wav(&wav, out)
+    }
+
+    /// Queue `ms` of silence as a real zero-PCM clip at the true rate, pre-buffering
+    /// lead at prime / re-anchor without depending on terminal Synth support.
+    fn emit_silence<W: Write + ?Sized>(&mut self, ms: u64, out: &mut W) -> io::Result<()> {
+        let n = (ms * self.out_rate as u64 / 1000) as usize;
+        if n == 0 {
+            return Ok(());
+        }
+        let wav = encode_wav_mono(&vec![0i16; n], self.out_rate);
+        self.send_wav(&wav, out)
+    }
+
+    /// Store+Load+Queue a ready WAV on the next rotating slot.
+    fn send_wav<W: Write + ?Sized>(&mut self, wav: &[u8], out: &mut W) -> io::Result<()> {
+        let b64 = base64_encode(wav);
         let slot = self.slot;
         self.slot = (self.slot + 1) % SLOTS;
 
@@ -383,49 +488,118 @@ mod tests {
     }
 
     #[test]
-    fn small_drift_speeds_up_without_dropping() {
-        // Compression only acts once the cushion is full, so set up that steady
-        // state directly: emitted sits right at the cushion edge (elapsed+target),
-        // a small emit gap keeps target at min_send, and we then produce a clip
-        // ~1.4% longer than the schedule's per-tick need.
+    fn drain_notification_reanchors_reprimes_and_keeps_drift() {
         let mut a = ApcAudio::new(40, 22050);
-        let mut out = Vec::new();
-        a.emit_ready(&mut out, 0).unwrap(); // prime
-        a.last_now_ms = 980;
-        a.jitter_ms = 20; // target = min_send(40).max(20) = 40
-        a.emitted_ms = 1020; // = elapsed(1000) + target(40) - need(20)
-        // need = 20ms = 441 samples @22050; push 448 (~1.6% over) so it compresses.
-        a.push_samples(&vec![0.2f32; 896 * 2]);
-        a.emit_ready(&mut out, 1000).unwrap();
-        let s = a.stats(1000);
-        assert_eq!(s.drops, 0, "no drops for sub-2% drift");
-        assert!(s.correction_pct > 0.5 && s.correction_pct <= MAX_CORRECTION_PCT + 0.01,
-            "applied a small speed-up, got {}", s.correction_pct);
-    }
-
-    #[test]
-    fn big_surplus_is_dropped_and_capped() {
-        // A stall dumps 1s of audio at once with the clock barely advanced.
-        let mut a = ApcAudio::new(40, 22050);
-        let mut out = Vec::new();
-        a.emit_ready(&mut out, 0).unwrap(); // prime
-        push_ms(&mut a, 1000);
-        a.emit_ready(&mut out, 60).unwrap();
-        let s = a.stats(60);
-        assert_eq!(s.drops, 1, "dropped the un-absorbable surplus once");
-        assert!(s.correction_pct <= MAX_CORRECTION_PCT + 0.01, "speed-up stayed within the cap");
-        // Lead is bounded to the measured cushion, not the 1s we produced.
-        assert!(s.lead_ms < 200, "lead {} should be bounded", s.lead_ms);
-    }
-
-    #[test]
-    fn drain_notification_reanchors_and_rearms() {
-        let mut a = ApcAudio::new(40, 22050);
+        a.drift_ema = 0.011; // a converged estimate that must SURVIVE the re-anchor
+        a.cor = 0.010;
         let mut out = Vec::new();
         a.notify_drain(&mut out, 1234).unwrap();
         assert_eq!(a.play_start_ms, 1234, "re-anchored to drain time");
-        assert_eq!(a.emitted_ms, 0, "queued-ahead reset to zero");
+        assert_eq!(a.emitted_ms, CUSHION_PRIME_MS as f64, "re-primed the silence cushion");
         assert_eq!(count(&out, b"A;Update;C=2"), 1, "re-armed the drain notify");
+        assert!(count(&out, b"A;Queue;C=2") >= 1, "re-queued a silence clip");
+        assert_eq!(a.drift_ema, 0.011, "drift estimate survives the re-anchor");
+        assert_eq!(a.cor, 0.010, "correction survives the re-anchor");
+    }
+
+    // ---- closed-loop stability harness ------------------------------------
+    // Drive the real emit_ready() with a producer running (1+drift) faster than
+    // wall-clock, an integer-ms wall clock with cadence jitter, and a terminal
+    // that underruns (fires notify_drain) when queued lead hits 0. Because the
+    // declared rate IS what the terminal plays at, emitted_ms is an exact account
+    // of queued realtime, so lead_ms is the true queued lead -- this measures what
+    // the ear cares about (smooth cor, held lead, rare drops), not self-consistent
+    // internal bookkeeping. Deterministic (seeded LCG), no device needed.
+    struct Sim {
+        cor: Vec<f32>,
+        lead: Vec<u32>,
+        drops: u32,
+        underruns: u32,
+    }
+
+    fn run_sim(drift: impl Fn(f64) -> f64, secs: u64, seed: u64) -> Sim {
+        let mut a = ApcAudio::new(40, 22050);
+        let mut out = Vec::new();
+        let mut rng = seed | 1;
+        let mut rand = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 40) as f64 / (1u64 << 24) as f64 // [0,1)
+        };
+        let mut wall = 0.0f64;
+        let mut prod_frac = 0.0f64;
+        let mut prev_lead = 0u32;
+        let (mut cor, mut lead) = (Vec::new(), Vec::new());
+        let mut underruns = 0u32;
+        let mut next_log = 0.0f64;
+        let end = (secs * 1000) as f64;
+        while wall <= end {
+            let dt = 16.0 + rand() * 12.0; // this tick's wall dt (16-28ms jitter)
+            wall += dt;
+            let d = drift(wall / 1000.0);
+            // Produce (1+d) * dt of SRC audio into the door this tick.
+            let src = 44100.0 * (1.0 + d) * dt / 1000.0 + prod_frac;
+            let nf = src.floor();
+            prod_frac = src - nf;
+            a.push_samples(&vec![0.15f32; (nf as usize) * 2]);
+            let now = wall.floor() as u64;
+            a.emit_ready(&mut out, now).unwrap();
+            out.clear();
+            if now > 0 && a.lead_ms == 0 && prev_lead > 0 {
+                underruns += 1;
+                a.notify_drain(&mut out, now).unwrap();
+                out.clear();
+            }
+            prev_lead = a.lead_ms;
+            if wall >= next_log {
+                let s = a.stats(now);
+                cor.push(s.correction_pct);
+                lead.push(s.lead_ms);
+                next_log += 1000.0;
+            }
+        }
+        Sim { cor, lead, drops: a.drops, underruns }
+    }
+
+    fn mean(v: &[f32]) -> f64 {
+        v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64
+    }
+    fn stddev(v: &[f32]) -> f64 {
+        let m = mean(v);
+        (v.iter().map(|&x| (x as f64 - m).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt()
+    }
+
+    #[test]
+    fn steady_drift_absorbed_smoothly_no_oscillation() {
+        // +1% producer for 60s. The whole point: cor must track ~1% SMOOTHLY (low
+        // stddev, no rail-to-rail) -- the exact opposite of attempt B (sd~1.7,
+        // +2/-2 sign-flips every second) -- while lead holds a cushion and drops
+        // and underruns stay near zero.
+        let r = run_sim(|_| 0.01, 60, 0xC0FFEE);
+        let warm = 15usize.min(r.cor.len().saturating_sub(1));
+        let cor = &r.cor[warm..];
+        let lead = &r.lead[warm..];
+        let cm = mean(cor);
+        let sd = stddev(cor);
+        assert!((0.5..=2.0).contains(&cm), "cor should track ~1% drift, mean={cm}");
+        assert!(sd < 0.35, "cor must be smooth, not oscillating: stddev={sd}");
+        let lm = lead.iter().map(|&x| x as f64).sum::<f64>() / lead.len() as f64;
+        assert!((40.0..=200.0).contains(&lm), "lead should hold a cushion, mean={lm}");
+        assert!(*lead.iter().min().unwrap() > 0, "lead must not starve to 0 in steady state");
+        assert!(r.drops <= 5, "steady sub-cap drift should barely drop: {}", r.drops);
+        assert!(r.underruns <= 3, "steady state should rarely underrun: {}", r.underruns);
+    }
+
+    #[test]
+    fn startup_transient_no_drop_storm() {
+        // +6.7% decaying to ~+1% (tau 6s) -- the real startup. cor should ride near
+        // the +2% cap while drift exceeds it, then ease down smoothly; drops must
+        // NOT climb like attempt B (~5/s). A handful during the transient is ok.
+        let r = run_sim(|t| 0.01 + 0.057 * (-t / 6.0).exp(), 45, 0x1234);
+        assert!(r.drops < 25, "startup should not drop-storm: {}", r.drops);
+        // By the end (well past the transient) cor has eased to the steady band.
+        let tail = &r.cor[r.cor.len().saturating_sub(8)..];
+        assert!(mean(tail) <= 2.0 + 0.01, "cor eased back under the cap by steady state");
+        assert!(stddev(tail) < 0.4, "cor smooth in the settled tail: sd={}", stddev(tail));
     }
 
     #[test]
