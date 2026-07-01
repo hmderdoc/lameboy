@@ -431,6 +431,10 @@ impl MenuState {
             typeahead: String::new(),
         };
         state.rebuild_filter();
+        // Reopen on the game the user last launched, if it's still in the list.
+        if let Some(name) = saved.last_game.as_deref() {
+            state.select_by_filename(name);
+        }
         state
     }
 
@@ -508,20 +512,43 @@ impl MenuState {
         }
     }
 
+    /// Move the cursor to the ROM whose file name matches `name` exactly (the
+    /// persisted last game). No-op if it's gone or filtered out of the list.
+    fn select_by_filename(&mut self, name: &str) {
+        if let Some(pos) = self.filtered.iter().position(|&i| {
+            self.rom_files[i]
+                .file_name()
+                .map(|n| n.to_string_lossy() == name)
+                .unwrap_or(false)
+        }) {
+            self.selected_rom_index = pos;
+            self.ensure_visible();
+        }
+    }
+
     /// Persist render/audio/filter prefs for this user, preserving whatever
-    /// roms_dir was explicitly saved (that is only set via "Set & Save").
+    /// roms_dir and last_game were saved (those are set elsewhere).
     fn persist_prefs(&self) {
-        let saved_dir = config::load(self.user.as_deref()).roms_dir;
+        let saved = config::load(self.user.as_deref());
         let _ = config::save(
             self.user.as_deref(),
             &config::Config {
-                roms_dir: saved_dir,
+                roms_dir: saved.roms_dir,
                 render_block: Some(self.render_mode == RenderMode::Block),
                 sound: Some(self.sound.code().to_string()),
                 filter: Some(self.filter.code().to_string()),
                 screen: Some(self.screen.code().to_string()),
+                last_game: saved.last_game,
             },
         );
+    }
+
+    /// Remember the game just launched, preserving the other saved prefs, so the
+    /// list reopens on it next time the menu is shown.
+    fn persist_last_game(&self, name: &str) {
+        let mut cfg = config::load(self.user.as_deref());
+        cfg.last_game = Some(name.to_string());
+        let _ = config::save(self.user.as_deref(), &cfg);
     }
 }
 
@@ -743,6 +770,20 @@ fn run_menu_loop(
                     state.current_section = state.current_section.next();
                 }
             }
+            // Page Up / Page Down move the game list a full visible page at a
+            // time (clamped to the ends) — quick travel through a long library.
+            Key::PageUp | Key::PageDown => {
+                if state.current_section == MenuSection::GameList && !state.filtered.is_empty() {
+                    state.typeahead.clear();
+                    let page = state.visible_rows.max(1);
+                    state.selected_rom_index = if key == Key::PageUp {
+                        state.selected_rom_index.saturating_sub(page)
+                    } else {
+                        (state.selected_rom_index + page).min(state.filtered.len() - 1)
+                    };
+                    state.ensure_visible();
+                }
+            }
             // Tab jumps between the Settings zone and the game list, keeping the
             // game-list selection where it was (so you can pop up, change a
             // setting, and come right back without scrolling).
@@ -797,6 +838,11 @@ fn run_menu_loop(
                 match state.current_section {
                     MenuSection::GameList => {
                         if let Some(rom_path) = state.selected_rom().cloned() {
+                            // Remember this game so the list reopens on it after
+                            // the player exits (this session and future ones).
+                            if let Some(name) = rom_path.file_name() {
+                                state.persist_last_game(&name.to_string_lossy());
+                            }
                             return Ok(Some(MenuConfig {
                                 rom_path,
                                 render_mode: state.render_mode,

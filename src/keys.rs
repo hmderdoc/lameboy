@@ -21,6 +21,8 @@ pub enum Key {
     Tab,
     BackTab,
     Backspace,
+    PageUp,
+    PageDown,
 }
 
 // Telnet
@@ -280,7 +282,16 @@ impl KeyDecoder {
                         }
                         b'K' => self.push_key_edges(true),  // `CSI = Pk;… K` press
                         b'k' => self.push_key_edges(false), // `CSI = Pk;… k` release
-                        _ => {} // Home/End/PgUp/~-sequences etc.: ignored
+                        b'~' => {
+                            // VT edit-keypad: `CSI 5 ~` = Page Up, `CSI 6 ~` = Page
+                            // Down. Modifier forms (`5;2~`) keep the same first field.
+                            match self.csi.split(';').next() {
+                                Some("5") => out.push(Key::PageUp),
+                                Some("6") => out.push(Key::PageDown),
+                                _ => {} // Home/End/Ins/Del (1/4/2/3~): ignored
+                            }
+                        }
+                        _ => {} // other final bytes: ignored
                     }
                     self.state = State::Ground;
                 } else {
@@ -490,6 +501,17 @@ mod tests {
         assert_eq!(d.feed(b"\x1b[24;80R"), []); // no key emitted
         assert_eq!(d.take_cursor(), Some((24, 80)));
         assert_eq!(d.take_cursor(), None);
+    }
+
+    #[test]
+    fn page_up_down_decode_from_vt_edit_keypad() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.feed(b"\x1b[5~"), [Key::PageUp]);
+        assert_eq!(d.feed(b"\x1b[6~"), [Key::PageDown]);
+        // Modifier forms keep the same first field (e.g. Shift+PageUp).
+        assert_eq!(d.feed(b"\x1b[5;2~"), [Key::PageUp]);
+        // Other edit-keypad keys (Home/Ins/Del/End = 1/2/3/4~) stay ignored.
+        assert_eq!(d.feed(b"\x1b[1~\x1b[3~"), []);
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub struct Config {
     pub filter: Option<String>,
     /// Persisted screen-size mode: "auto" | "best".
     pub screen: Option<String>,
+    /// File name of the last game the user launched, so the list reopens on it.
+    pub last_game: Option<String>,
 }
 
 /// Load config from disk. Returns defaults on any error or if the file doesn't
@@ -75,6 +77,11 @@ pub fn load(user: Option<&str>) -> Config {
             cfg.filter = Some(val.trim().to_lowercase());
         } else if let Some(val) = line.strip_prefix("screen=") {
             cfg.screen = Some(val.trim().to_lowercase());
+        } else if let Some(val) = line.strip_prefix("last_game=") {
+            let v = val.trim();
+            if !v.is_empty() {
+                cfg.last_game = Some(v.to_string());
+            }
         }
     }
 
@@ -107,6 +114,9 @@ pub fn save(user: Option<&str>, cfg: &Config) -> io::Result<()> {
     }
     if let Some(ref s) = cfg.screen {
         contents.push_str(&format!("screen={}\n", s));
+    }
+    if let Some(ref g) = cfg.last_game {
+        contents.push_str(&format!("last_game={}\n", g));
     }
     std::fs::write(file, contents)?;
     Ok(())
