@@ -38,6 +38,9 @@ const SLOTS: u8 = 8;
 /// psychoacoustic bound (a ~2% pitch shift is hard to notice on lo-fi GB audio),
 /// not a tuning knob -- surplus beyond what this can compress is dropped instead.
 const MAX_CORRECTION_PCT: f32 = 2.0;
+/// Silence re-primed after a periodic resync flush, in ms. Just enough to bridge
+/// the gap until the next real clip so playback resumes without dead air/a click.
+const REPRIME_SILENCE_MS: u32 = 20;
 
 /// A snapshot of the stream's health for the on-screen/log diagnostics.
 #[derive(Clone, Copy, Default)]
@@ -203,6 +206,45 @@ impl ApcAudio {
         out.flush()
     }
 
+    /// Periodic "engine restart": drop the latency that piles up in the
+    /// terminal's channel FIFO. The producer runs a hair faster than realtime, so
+    /// each second it hands over slightly more audio than the terminal plays; the
+    /// surplus is never dropped (our own accounting reads lead==0, cor==0) and
+    /// accumulates as an ever-growing unplayed tail in the terminal's FIFO — audio
+    /// drifts further behind the picture the longer a game runs. The baseline
+    /// emit_ready control can't see or clear that tail. So on a timer we hard-reset
+    /// it: `A;Flush;C=2` frees the terminal's whole head..tail backlog, we drop our
+    /// own pending accum, re-anchor the timeline to "queued == 0 now" (as
+    /// notify_drain does), re-arm the one-shot drain notify (the flush leaves the
+    /// channel idle and can itself trip a drain report), and re-prime a few ms of
+    /// silence so playback resumes on the next tick without a gap or click. The
+    /// cost is one brief skip per interval, capping the tail at interval * drift.
+    pub fn resync<W: Write + ?Sized>(&mut self, out: &mut W, now_ms: u64) -> io::Result<()> {
+        // Not primed yet: nothing has been queued, so there is no tail to drop.
+        if !self.primed {
+            return Ok(());
+        }
+        // 1) Flush the terminal channel FIFO (head..tail) — drops the whole tail.
+        out.write_all(b"\x1b_SyncTERM:A;Flush;C=")?;
+        write_u8_dec(out, CHANNEL)?;
+        out.write_all(b"\x1b\\")?;
+        // 2) Drop our own pending backlog so we don't re-ship the flushed audio.
+        self.accum.clear();
+        // 3) Re-anchor the realtime timeline to "queued == 0 now" (like notify_drain).
+        self.play_start_ms = now_ms;
+        self.emitted_ms = 0;
+        self.lead_ms = 0;
+        // 4) Re-arm the one-shot drain notify (the flush idles the channel).
+        self.arm_update(out)?;
+        // 5) Re-prime a small silence cushion so playback resumes immediately with
+        //    no dead air or click; count it as emitted so the schedule stays honest.
+        let cushion = (self.out_rate as usize * REPRIME_SILENCE_MS as usize / 1000).max(1);
+        let silence = vec![0i16; cushion];
+        self.emit_raw(&silence, self.out_rate, out)?;
+        self.emitted_ms += cushion as u64 * 1000 / self.out_rate as u64;
+        out.flush()
+    }
+
     /// On exit, flush the channel FIFO so no queued audio plays after the door
     /// returns to the menu (the latency "tail").
     pub fn stop<W: Write + ?Sized>(&mut self, out: &mut W) -> io::Result<()> {
@@ -239,7 +281,20 @@ impl ApcAudio {
     fn emit_chunk<W: Write + ?Sized>(&mut self, n: usize, rate: u32, out: &mut W) -> io::Result<()> {
         let wav = encode_wav_mono(&self.accum[..n], rate);
         self.accum.drain(0..n);
-        let b64 = base64_encode(&wav);
+        self.emit_wav(&wav, out)
+    }
+
+    /// Emit an arbitrary sample slice (not from `accum`) as one Store+Load+Queue
+    /// clip at the given declared rate. Used to re-prime the silence cushion after
+    /// a periodic resync flush, where `accum` has just been cleared.
+    fn emit_raw<W: Write + ?Sized>(&mut self, samples: &[i16], rate: u32, out: &mut W) -> io::Result<()> {
+        let wav = encode_wav_mono(samples, rate);
+        self.emit_wav(&wav, out)
+    }
+
+    /// Store+Load+Queue an already-encoded WAV on our channel, cycling the slot.
+    fn emit_wav<W: Write + ?Sized>(&mut self, wav: &[u8], out: &mut W) -> io::Result<()> {
+        let b64 = base64_encode(wav);
         let slot = self.slot;
         self.slot = (self.slot + 1) % SLOTS;
 
@@ -426,6 +481,43 @@ mod tests {
         assert_eq!(a.play_start_ms, 1234, "re-anchored to drain time");
         assert_eq!(a.emitted_ms, 0, "queued-ahead reset to zero");
         assert_eq!(count(&out, b"A;Update;C=2"), 1, "re-armed the drain notify");
+    }
+
+    #[test]
+    fn resync_flushes_reanchors_rearms_and_reprimes() {
+        let mut a = ApcAudio::new(40, 22050);
+        let mut out = Vec::new();
+        // Prime + queue a clip so there's a live timeline and a pending backlog.
+        push_ms(&mut a, 60);
+        a.emit_ready(&mut out, 0).unwrap();
+        push_ms(&mut a, 60); // leftover accum the resync must drop
+        out.clear();
+
+        a.resync(&mut out, 5000).unwrap();
+
+        // Flushed the terminal FIFO, re-armed the drain notify, and queued the
+        // silence cushion (Store+Load+Queue) so playback resumes without a gap.
+        assert_eq!(count(&out, b"A;Flush;C=2"), 1, "flushed the channel");
+        assert_eq!(count(&out, b"A;Update;C=2"), 1, "re-armed the drain notify");
+        assert_eq!(count(&out, b"A;Queue;C=2"), 1, "re-primed a silence cushion");
+        // The Flush must precede the re-primed cushion (don't queue then flush it).
+        let flush_at = out.windows(11).position(|w| w == b"A;Flush;C=2").unwrap();
+        let queue_at = out.windows(11).position(|w| w == b"A;Queue;C=2").unwrap();
+        assert!(flush_at < queue_at, "flush before the re-primed clip");
+        // Re-anchored the timeline; own backlog cleared.
+        assert_eq!(a.play_start_ms, 5000, "re-anchored to resync time");
+        assert!(a.accum.is_empty(), "dropped the pending backlog");
+        // emitted_ms reflects only the re-primed cushion, not the old timeline.
+        assert_eq!(a.emitted_ms, REPRIME_SILENCE_MS as u64, "emitted == cushion");
+    }
+
+    #[test]
+    fn resync_before_prime_is_a_noop() {
+        // Never primed (no clip queued): there is no terminal tail to flush.
+        let mut a = ApcAudio::new(40, 22050);
+        let mut out = Vec::new();
+        a.resync(&mut out, 1000).unwrap();
+        assert!(out.is_empty(), "no I/O before the stream is primed");
     }
 
     #[test]

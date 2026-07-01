@@ -568,6 +568,16 @@ fn run_game(
         None
     };
     let mut apc_log_timer = Instant::now();
+    // Periodic APC audio resync ("engine restart"): the producer runs a hair
+    // faster than realtime, so the terminal's channel FIFO accrues an unplayed
+    // tail (audio drifting behind video) that the baseline emit_ready can't see or
+    // clear. Every `resync_secs` we hard-flush that channel and re-anchor, capping
+    // the tail. 0 disables. Only meaningful when APC is streaming.
+    let resync_interval = match apc_tuning.resync_secs {
+        0 => None,
+        s => Some(Duration::from_secs(s as u64)),
+    };
+    let mut resync_timer = Instant::now();
 
     let mut running = true;
     // Track when each button was last seen, to release it on timeout.
@@ -714,6 +724,15 @@ fn run_game(
         // drop big stalls) so sound stays in sync even while video frames skip.
         if let Some(a) = apc.as_mut() {
             let now_ms = audio_clock.elapsed().as_millis() as u64;
+            // Periodic hard resync first: flush the terminal FIFO + re-anchor +
+            // re-prime, dropping the accumulated latency, before this tick's clip
+            // ships on top of the fresh cushion. (Order matters — flush, then emit.)
+            if let Some(iv) = resync_interval {
+                if resync_timer.elapsed() >= iv {
+                    resync_timer = Instant::now();
+                    a.resync(&mut *term, now_ms)?;
+                }
+            }
             a.emit_ready(&mut *term, now_ms)?;
             // Log stream health ~1/sec to the file (survives frame-skip).
             if apc_log_timer.elapsed() >= Duration::from_secs(1) {

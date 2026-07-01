@@ -143,6 +143,9 @@ pub struct DoorIni {
     pub audio_chunk_ms: Option<u32>,
     /// APC audio output sample rate (Hz); lower = less bandwidth on the link.
     pub audio_rate: Option<u32>,
+    /// Seconds between periodic APC audio resyncs (0 = disabled). A hard channel
+    /// flush + re-anchor that drops the latency piling up in the terminal's FIFO.
+    pub audio_resync_secs: Option<u32>,
 }
 
 /// APC audio stream tuning, sourced from `lameboy.ini` (sysop) with built-in
@@ -153,10 +156,13 @@ pub struct DoorIni {
 pub struct ApcTuning {
     pub chunk_ms: u32,
     pub rate: u32,
+    /// Seconds between periodic resyncs (0 = off). Caps the terminal-side FIFO
+    /// latency at roughly this interval times the producer's over-realtime drift.
+    pub resync_secs: u32,
 }
 
 impl ApcTuning {
-    pub const DEFAULT: ApcTuning = ApcTuning { chunk_ms: 40, rate: 22050 };
+    pub const DEFAULT: ApcTuning = ApcTuning { chunk_ms: 40, rate: 22050, resync_secs: 60 };
 }
 
 impl Default for ApcTuning {
@@ -171,6 +177,7 @@ impl DoorIni {
         ApcTuning {
             chunk_ms: self.audio_chunk_ms.unwrap_or(ApcTuning::DEFAULT.chunk_ms),
             rate: self.audio_rate.unwrap_or(ApcTuning::DEFAULT.rate),
+            resync_secs: self.audio_resync_secs.unwrap_or(ApcTuning::DEFAULT.resync_secs),
         }
     }
 }
@@ -219,6 +226,11 @@ fn parse_door_ini(text: &str) -> DoorIni {
             "audio_rate" | "rate" | "audio_hz" => {
                 ini.audio_rate = val.parse::<u32>().ok().map(|v| v.clamp(5512, 44100));
             }
+            "audio_resync_secs" | "resync_secs" => {
+                // 0 disables; otherwise clamp to a sane interval window.
+                ini.audio_resync_secs =
+                    val.parse::<u32>().ok().map(|v| if v == 0 { 0 } else { v.clamp(5, 3600) });
+            }
             _ => {}
         }
     }
@@ -251,8 +263,13 @@ mod tests {
         // Out-of-range values clamp to the supported window.
         assert_eq!(parse_door_ini("audio_chunk_ms=1").audio_chunk_ms, Some(10));
         assert_eq!(parse_door_ini("audio_rate=999999").audio_rate, Some(44100));
+        // Resync interval: 0 disables verbatim; nonzero clamps to [5, 3600].
+        assert_eq!(parse_door_ini("audio_resync_secs=0").audio_resync_secs, Some(0));
+        assert_eq!(parse_door_ini("audio_resync_secs=90").audio_resync_secs, Some(90));
+        assert_eq!(parse_door_ini("audio_resync_secs=1").audio_resync_secs, Some(5));
+        assert_eq!(parse_door_ini("audio_resync_secs=99999").audio_resync_secs, Some(3600));
         // Unset -> built-in defaults via apc_tuning().
         let d = DoorIni::default().apc_tuning();
-        assert_eq!((d.chunk_ms, d.rate), (40, 22050));
+        assert_eq!((d.chunk_ms, d.rate, d.resync_secs), (40, 22050, 60));
     }
 }
