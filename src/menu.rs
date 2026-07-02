@@ -1000,7 +1000,10 @@ fn run_menu_loop(
     let mut term_rows: u16 = 24;
     let mut term_cols: u16 = 80;
 
-    'redraw: loop {
+    // A full redraw wipes the screen only on the first entry and after a resize;
+    // steady redraws overpaint in place (no `\x1b[2J`, so no flicker).
+    let mut needs_clear = true;
+    'outer: loop {
         state.visible_rows = visible_for(term_rows);
         // Re-resolve the color depth: for Auto this folds in the probe reply once
         // it lands (the burst rides the size probe), so the menu self-corrects
@@ -1011,8 +1014,9 @@ fn run_menu_loop(
         // borrow so we can read input from the same terminal.
         {
             let mut stdout = Cp437Writer::new(&mut *term);
-            draw_menu(&mut stdout, state)?;
+            draw_menu(&mut stdout, state, needs_clear)?;
         }
+        needs_clear = false;
         // Ask the terminal its size; the reply comes back as a Resize event below
         // and re-lays-out the list — no keystroke needed. Capability probes ride
         // along (folded in) until keyboard detection resolves.
@@ -1021,18 +1025,18 @@ fn run_menu_loop(
 
         // Wait for a key, applying any size reports in between (redraw only when
         // the height actually changes, so a stable size doesn't busy-loop).
-        let key = loop {
+        'events: loop {
             // The color probe reply rides the size-probe burst; when it lands and
             // changes the resolved depth (Auto -> 256), repaint at the new depth
             // even if the terminal size didn't change.
             if state.color.resolve(input.color_probe()) != state.resolved_depth {
-                continue 'redraw;
+                continue 'outer;
             }
-            match input.wait_event(term)? {
+            let key = match input.wait_event(term)? {
                 MenuEvent::Key(k) => {
                     idle_start = Instant::now(); // any key resets the attract idle
                     interacted = true;
-                    break k;
+                    k
                 }
                 MenuEvent::Resize(rows, cols) => {
                     // Persisted "Best" not yet applied: the reported size is the
@@ -1041,13 +1045,16 @@ fn run_menu_loop(
                         *screen_orig = Some((rows, cols));
                         let _ = crate::resize_terminal(term, BEST_ROWS, BEST_COLS);
                         let _ = term.flush();
-                        continue 'redraw;
+                        needs_clear = true;
+                        continue 'outer;
                     }
                     term_cols = cols;
                     if rows >= 10 && rows != term_rows {
                         term_rows = rows;
-                        continue 'redraw;
+                        needs_clear = true;
+                        continue 'outer;
                     }
+                    continue 'events;
                 }
                 // Idle: re-probe so a resize that happened while we sat still is
                 // noticed (its reply arrives as a Resize on the next iteration).
@@ -1070,9 +1077,9 @@ fn run_menu_loop(
                     }
                     let _ = crate::send_size_probe(&mut *term, !input.caps_resolved());
                     let _ = term.flush();
+                    continue 'events;
                 }
-            }
-        };
+            };
 
         // ── Game-list type-ahead ────────────────────────────────────────────
         // While the game list is focused, printable keys drive an incremental
@@ -1088,17 +1095,22 @@ fn run_menu_loop(
                     last_key = Instant::now();
                     state.typeahead.push(c);
                     state.typeahead_jump();
-                    continue;
+                    continue 'outer;
                 }
                 Key::Backspace => {
                     state.typeahead.pop();
                     last_key = Instant::now();
                     state.typeahead_jump();
-                    continue;
+                    continue 'outer;
                 }
                 _ => {}
             }
         }
+
+        // Snapshot the view before handling the key, to pick the redraw scope after.
+        let prev_sel = state.selected_rom_index;
+        let prev_scroll = state.scroll_offset;
+        let prev_section = state.current_section;
 
         match key {
             Key::Char('q') | Key::Char('Q') | Key::Esc => {
@@ -1232,16 +1244,77 @@ fn run_menu_loop(
         if state.current_section != MenuSection::GameList {
             state.last_settings = state.current_section;
         }
+
+        // A plain selection move within the same viewport repaints only the two
+        // affected rows — no full-screen redraw, no flicker. Anything structural
+        // (scroll, section change, filter, a settings change) does a full redraw.
+        if prev_section == MenuSection::GameList
+            && state.current_section == MenuSection::GameList
+            && state.scroll_offset == prev_scroll
+            && state.selected_rom_index != prev_sel
+        {
+            {
+                let mut stdout = Cp437Writer::new(&mut *term);
+                redraw_rom_row(&mut stdout, state, prev_sel)?;
+                redraw_rom_row(&mut stdout, state, state.selected_rom_index)?;
+            }
+            let _ = term.flush();
+            continue 'events;
+        }
+        continue 'outer;
+        }
     }
 }
 
-fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
+/// Draw a single game row by its index into `filtered`, at its current viewport
+/// position (no-op if it isn't currently visible). Shared by the full draw and
+/// the incremental selection-move redraw so both render a row identically.
+fn redraw_rom_row<W: Write>(
+    stdout: &mut W,
+    state: &MenuState,
+    actual_index: usize,
+) -> io::Result<()> {
+    if actual_index < state.scroll_offset {
+        return Ok(());
+    }
+    let vp = actual_index - state.scroll_offset;
+    let visible = state.visible_rows.min(state.filtered.len().saturating_sub(state.scroll_offset));
+    if vp >= visible {
+        return Ok(());
+    }
+    let rom = &state.rom_files[state.filtered[actual_index]];
+    let title = rom
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let is_gbc = rom
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("gbc"))
+        .unwrap_or(false);
+    draw_rom_row(
+        stdout,
+        GAMES_START_Y + vp as u16,
+        &title,
+        is_gbc,
+        actual_index == state.selected_rom_index,
+        state.current_section == MenuSection::GameList,
+    )
+}
+
+/// Draw the full menu. `clear` does a one-time full-screen wipe (first entry /
+/// resize); otherwise the fixed layout is overpainted in place — no `\x1b[2J`, so
+/// there's no blank-frame flicker. The LCD background persists from the first
+/// clear; stale game rows below a shrunken list are wiped at the end.
+fn draw_menu(stdout: &mut impl Write, state: &MenuState, clear: bool) -> io::Result<()> {
     // Push the resolved depth to the color accessors before anything draws, so the
     // whole menu paints at the caller's color depth (truecolor / 256 / 16).
     set_menu_depth(state.resolved_depth);
 
-    // Paint the whole screen the Game Boy LCD background, then draw dark ink on it.
-    emit!(stdout, Bg(screen_bg()), Clear(ClearType::All))?;
+    // Establish the Game Boy LCD background; wipe the screen only when asked.
+    emit!(stdout, Bg(screen_bg()))?;
+    if clear {
+        emit!(stdout, Clear(ClearType::All))?;
+    }
 
     // Hints at the very top so they stay in view on tall terminals.
     emit!(
@@ -1331,6 +1404,10 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
     }
 
     let games_start_y = GAMES_START_Y;
+    // First screen row after whatever the list draws — anything from here down is
+    // wiped below, so a shrunken list (e.g. after a filter change) leaves no stale
+    // rows even though we skipped the full-screen clear.
+    let mut first_empty = games_start_y + 1;
     if state.filtered.is_empty() {
         let msg = if state.rom_files.is_empty() {
             "No ROMs found — add .gb/.gbc files beside the binary"
@@ -1339,34 +1416,14 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
         };
         emit!(stdout, MoveTo(4, games_start_y), Fg(dim_color()), Print(msg), NORMAL)?;
     } else {
-        let visible_count = state.visible_rows.min(state.filtered.len());
-        let is_game_list_selected = state.current_section == MenuSection::GameList;
+        let visible_count = state
+            .visible_rows
+            .min(state.filtered.len().saturating_sub(state.scroll_offset));
 
-        for (i, &rom_idx) in state.filtered.iter()
-            .skip(state.scroll_offset)
-            .take(visible_count)
-            .enumerate()
-        {
-            let rom = &state.rom_files[rom_idx];
-            let actual_index = state.scroll_offset + i;
-            let is_selected = actual_index == state.selected_rom_index;
-
-            let title = rom.file_stem()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
-            let is_gbc = rom.extension()
-                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("gbc"))
-                .unwrap_or(false);
-
-            draw_rom_row(
-                stdout,
-                games_start_y + i as u16,
-                &title,
-                is_gbc,
-                is_selected,
-                is_game_list_selected,
-            )?;
+        for i in 0..visible_count {
+            redraw_rom_row(stdout, state, state.scroll_offset + i)?;
         }
+        first_empty = games_start_y + visible_count as u16;
 
         // Scroll indicators
         let arrow_x: u16 = 65;
@@ -1377,6 +1434,10 @@ fn draw_menu(stdout: &mut impl Write, state: &MenuState) -> io::Result<()> {
             emit!(stdout, MoveTo(arrow_x, games_start_y + visible_count as u16 - 1), Fg(key_color()), Print("▼"), NORMAL)?;
         }
     }
+
+    // Wipe anything below the list (stale rows from a longer previous list). On a
+    // full-clear draw this is already blank; the cost is one escape either way.
+    emit!(stdout, MoveTo(0, first_empty), Bg(screen_bg()), Clear(ClearType::FromCursorDown))?;
 
     stdout.flush()?;
     Ok(())
@@ -1509,7 +1570,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = Cp437Writer::new(&mut buf);
-            draw_menu(&mut w, &state).unwrap();
+            draw_menu(&mut w, &state, true).unwrap();
         }
         assert!(contains(&buf, b"\x1b[48;2;202;220;159m"), "LCD background not emitted");
         assert!(contains(&buf, b"\x1b[38;2;48;98;48m"), "ink text not emitted");
@@ -1525,7 +1586,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = Cp437Writer::new(&mut buf);
-            draw_menu(&mut w, &state).unwrap();
+            draw_menu(&mut w, &state, true).unwrap();
         }
         assert!(contains(&buf, b"DOT MATRIX WITH STEREO SOUND"), "band label missing");
         // Red-over-blue rule: CP437 upper-half block (0xDF), red fg on blue bg.
@@ -1548,7 +1609,7 @@ mod tests {
             let mut buf: Vec<u8> = Vec::new();
             {
                 let mut w = Cp437Writer::new(&mut buf);
-                draw_menu(&mut w, &state).unwrap();
+                draw_menu(&mut w, &state, true).unwrap();
             }
             buf
         };
